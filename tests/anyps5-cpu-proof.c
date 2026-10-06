@@ -182,6 +182,144 @@ static void verify_aliases(uint8_t *code, uint8_t *data, size_t size)
     check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy alias proof CPU");
 }
 
+static void verify_services(uint8_t *code, uint8_t *data, size_t size)
+{
+    char error[256] = {0};
+    AnyPS5QemuCpu *cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    uint64_t code_id, data_id, observed;
+    AnyPS5QemuRunResult result;
+    const uint64_t sentinel = 0x123456789abcdef0ULL;
+    const uint8_t midstream[] = {0x90,0x0f,0x08,0x48,0x89,0x07};
+    struct { uint8_t bytes[5]; size_t length; } services[] = {
+        {{0xf4},1}, {{0xfa},1}, {{0xfb},1}, {{0x0f,0x06},2},
+        {{0x0f,0x08},2}, {{0x0f,0x09},2}, {{0x0f,0x30},2}, {{0x0f,0x32},2},
+        {{0x0f,0x20,0xc0},3}, {{0x0f,0x21,0xc0},3},
+        {{0x0f,0x22,0xc0},3}, {{0x0f,0x23,0xc0},3},
+        {{0x44,0x0f,0x20,0xc0},4}, {{0x44,0x40,0x0f,0x20,0xd0},5},
+        {{0x0f,0x34},2}, {{0x0f,0x07},2}, {{0x0f,0x35},2},
+        {{0x0f,0x00,0xd0},3}, {{0x0f,0x00,0xd8},3},
+        {{0x0f,0x01,0x17},3}, {{0x0f,0x01,0x1f},3},
+        {{0x0f,0x01,0x3f},3}, {{0x0f,0x01,0xf0},3},
+        {{0x0f,0x01,0xf8},3}, {{0x0f,0x01,0xc8},3},
+        {{0x0f,0x01,0xc9},3}, {{0x0f,0x01,0xd1},3},
+        {{0xe4,0x80},2}, {{0xe5,0x80},2}, {{0xe6,0x80},2}, {{0xe7,0x80},2},
+        {{0xec},1}, {{0xed},1}, {{0xee},1}, {{0xef},1},
+        {{0x6c},1}, {{0x6d},1}, {{0x6e},1}, {{0x6f},1}
+    };
+
+    require(cpu != NULL, "create service proof CPU");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, code, size, &code_id), "register service code");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &data_id), "register service data");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x500000, code_id, 0, 4096, 4), "map execute-only service code");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x501000, code_id, 4096, 4096, 4), "map adjacent execute-only alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x600000, data_id, 0, 4096, 3), "map service sentinel");
+    memcpy(code+0xa00, midstream, sizeof(midstream));
+    memcpy(data+128, &sentinel, sizeof(sentinel));
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x600080);
+    set_reg(cpu, ANYPS5_QEMU_RAX, 0xfeedfaceULL);
+    set_reg(cpu, ANYPS5_QEMU_RFLAGS, 0x803);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500a00);
+    check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate midstream INVD source");
+    check_api(cpu, anyps5_qemu_cpu_run_until(cpu, 16, 0x500a06, &result), "run midstream INVD");
+    memcpy(&observed, data+128, sizeof(observed));
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 13 &&
+            result.rip == 0x500a01 && result.instructions == 1 &&
+            get_reg(cpu, ANYPS5_QEMU_RAX) == 0xfeedfaceULL &&
+            get_reg(cpu, ANYPS5_QEMU_RFLAGS) == 0x803 && observed == sentinel,
+            "NOP then INVD fails before retirement or sentinel store with unchanged registers/flags/memory");
+    const struct { uint8_t bytes[5]; size_t length; const char *name; } invalid[] = {
+        {{0x0f,0x20,0xc8},3,"reserved CR1 read remains #UD"},
+        {{0x0f,0x22,0xc8},3,"reserved CR1 write remains #UD"},
+        {{0x0f,0x20,0xe8},3,"reserved CR5 read remains #UD"},
+        {{0x44,0x0f,0x20,0xc8},4,"REX-selected reserved CR9 remains #UD"},
+        {{0x44,0x0f,0x21,0xc0},4,"REX-selected reserved DR8 read remains #UD"},
+        {{0x44,0x0f,0x23,0xc0},4,"REX-selected reserved DR8 write remains #UD"},
+        {{0x40,0x44,0x0f,0x20,0xd0},5,"final REX-selected reserved CR10 remains #UD"},
+        {{0x44,0x66,0x0f,0x21,0xc0},5,"mixed-order REX/legacy prefix remains owned by QEMU #UD"},
+        {{0x66,0x0f,0x01,0xd1},4,"operand-prefixed XSETBV remains #UD"},
+        {{0xf2,0x0f,0x01,0xd1},4,"REPNE-prefixed XSETBV remains #UD"},
+        {{0xf3,0x0f,0x01,0xd1},4,"REP-prefixed XSETBV remains #UD"},
+        {{0x66,0x0f,0x01,0xd0},4,"operand-prefixed XGETBV remains #UD"}
+    };
+    for (size_t encoding = 0; encoding < sizeof(invalid)/sizeof(invalid[0]); encoding++) {
+        memcpy(code+0xb00, invalid[encoding].bytes, invalid[encoding].length);
+        check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate reserved service encoding");
+        set_reg(cpu, ANYPS5_QEMU_RIP, 0x500b00);
+        result = run(cpu, 16);
+        require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 6 &&
+                result.instructions == 0 && result.rip == 0x500b00,
+                invalid[encoding].name);
+    }
+    for (size_t service = 0; service < sizeof(services)/sizeof(services[0]); service++) {
+        code[0xa50] = 0x90;
+        memcpy(code+0xa51, services[service].bytes, services[service].length);
+        memcpy(code+0xa51+services[service].length, midstream+3, 3);
+        check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate service case");
+        set_reg(cpu, ANYPS5_QEMU_RIP, 0x500a50);
+        result = run(cpu, 1);
+        require(result.reason == ANYPS5_QEMU_BUDGET && result.instructions == 1 &&
+                result.rip == 0x500a51, "budget stops immediately before service instruction");
+        result = run(cpu, 16);
+        memcpy(&observed, data+128, sizeof(observed));
+        const uint32_t expected_vector = services[service].length == 3 &&
+            services[service].bytes[0] == 0x0f && services[service].bytes[1] == 0x01 &&
+            (services[service].bytes[2] == 0xc8 || services[service].bytes[2] == 0xc9) ? 6 : 13;
+        require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == expected_vector &&
+                result.rip == 0x500a51 && result.instructions == 0 &&
+                get_reg(cpu, ANYPS5_QEMU_RAX) == 0xfeedfaceULL &&
+                get_reg(cpu, ANYPS5_QEMU_RFLAGS) == 0x803 && observed == sentinel,
+                "resumed budget rejects service at its exact PC without side effects");
+    }
+    memset(code+0xc00, 0x66, 14);
+    code[0xc0e] = 0xf4;
+    code[0xd00] = 0xf0; code[0xd01] = 0x0f; code[0xd02] = 0x08;
+    code[0xe80] = 0xf4;
+    code[0xfff] = 0x0f; code[0x1000] = 0x08;
+    check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate prefixed and boundary service code");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500c00);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 13 &&
+            result.instructions == 0 && result.rip == 0x500c00,
+            "maximum fifteen-byte prefixed privileged instruction is guarded");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500d00);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 6 &&
+            result.instructions == 0 && result.rip == 0x500d00,
+            "invalid LOCK INVD keeps architectural undefined-instruction precedence");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x500e80, 99), "add host gate containing HLT");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500e80);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 99 &&
+            result.instructions == 0, "authorized host gate precedes service guard");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500fff);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 13 &&
+            result.instructions == 0 && result.rip == 0x500fff,
+            "service decoder crosses adjacent executable guest aliases safely");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x501000), "remove service continuation alias");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500fff);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == 0x501000 && result.instructions == 0,
+            "missing second opcode byte remains an actual guest fetch fault");
+    code[0xfff] = 0xe4;
+    check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate truncated immediate port input");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500fff);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == 0x501000 && result.instructions == 0,
+            "missing port immediate remains an actual guest fetch fault");
+    code[0xffb] = 0x0f; code[0xffc] = 0x01; code[0xffd] = 0x15;
+    code[0xffe] = 0; code[0xfff] = 0;
+    check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate truncated descriptor displacement");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x500ffb);
+    result = run(cpu, 16);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == 0x501000 && result.instructions == 0,
+            "missing privileged memory displacement retains guest fetch-fault precedence");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy guarded-service CPU");
+}
+
 int main(void)
 {
     char error[256] = {0};
@@ -476,8 +614,9 @@ int main(void)
         check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy recreated CPU");
     }
     verify_aliases(code, data, region_size);
+    verify_services(code, data, region_size);
     free(code);
     free(data);
-    puts("PASS: native ARM64 TCG vectors/state, shared 4KiB aliases, partial protection, code coherence, TLS, stop/until, services and repeated lifecycle");
+    puts("PASS: native ARM64 TCG vectors/state, shared aliases, protection/coherence/TLS, lifecycle and every-step service guard");
     return 0;
 }

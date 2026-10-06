@@ -145,6 +145,140 @@ static AnyPS5QemuBacking *find_backing(AnyPS5QemuCpu *cpu, uint64_t id)
     return NULL;
 }
 
+static bool executable_byte(AnyPS5QemuCpu *cpu, uint64_t pc, size_t offset,
+                            uint8_t *value)
+{
+    AnyPS5QemuRange *range;
+    uint64_t address;
+
+    if (offset >= 15 || pc > 0x7fffffffffffULL - offset) {
+        return false;
+    }
+    address = pc + offset;
+    range = find_range(cpu, address, 1);
+    if (!range || !(range_permissions(range, address, 1) & ANYPS5_QEMU_EXECUTE)) {
+        return false;
+    }
+    *value = ((uint8_t *)range->backing->host)[range->region.alias_offset +
+                                              address - range->address];
+    return true;
+}
+
+static bool complete_modrm(AnyPS5QemuCpu *cpu, uint64_t pc, size_t offset,
+                           uint8_t modrm)
+{
+    unsigned mod = modrm >> 6;
+    unsigned rm = modrm & 7;
+    unsigned displacement = mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    uint8_t byte;
+
+    if (mod == 3) {
+        return true;
+    }
+    if (rm == 4) {
+        if (!executable_byte(cpu, pc, ++offset, &byte)) {
+            return false;
+        }
+        if (mod == 0 && (byte & 7) == 5) {
+            displacement = 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        displacement = 4;
+    }
+    while (displacement--) {
+        if (!executable_byte(cpu, pc, ++offset, &byte)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool application_service_instruction(AnyPS5QemuCpu *cpu, uint64_t pc)
+{
+    uint8_t opcode, second, modrm;
+    size_t offset = 0;
+    bool lock = false;
+    bool data_or_rep = false;
+    bool rex_seen = false;
+    bool legacy_after_rex = false;
+    unsigned rex_r = 0;
+
+    while (executable_byte(cpu, pc, offset, &opcode)) {
+        if ((opcode >= 0x40 && opcode <= 0x4f) || opcode == 0x66 ||
+            opcode == 0x67 || opcode == 0xf0 || opcode == 0xf2 ||
+            opcode == 0xf3 || opcode == 0x26 || opcode == 0x2e ||
+            opcode == 0x36 || opcode == 0x3e || opcode == 0x64 ||
+            opcode == 0x65) {
+            lock |= opcode == 0xf0;
+            data_or_rep |= opcode == 0x66 || opcode == 0xf2 || opcode == 0xf3;
+            if (opcode >= 0x40 && opcode <= 0x4f) {
+                rex_seen = true;
+                rex_r = (opcode & 4) << 1;
+            } else {
+                legacy_after_rex |= rex_seen;
+            }
+            offset++;
+            continue;
+        }
+        /* Invalid LOCK and incomplete/overlong encodings remain QEMU's faults. */
+        if (lock) {
+            return false;
+        }
+        switch (opcode) {
+        case 0xf4: case 0xfa: case 0xfb:
+        case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+        case 0xec: case 0xed: case 0xee: case 0xef:
+            return true;
+        case 0xe4: case 0xe5: case 0xe6: case 0xe7:
+            return executable_byte(cpu, pc, offset + 1, &second);
+        case 0x0f:
+            if (!executable_byte(cpu, pc, ++offset, &second)) {
+                return false;
+            }
+            switch (second) {
+            case 0x06: case 0x07: case 0x08: case 0x09:
+            case 0x30: case 0x32: case 0x34: case 0x35:
+                return true;
+            case 0x20: case 0x21: case 0x22: case 0x23:
+                if (!executable_byte(cpu, pc, offset + 1, &modrm) || legacy_after_rex) {
+                    /* Leave mixed prefix ordering to the actual decoder. */
+                    return false;
+                }
+                unsigned selector = ((modrm >> 3) & 7) | rex_r;
+                if (second == 0x20 || second == 0x22) {
+                    return selector == 0 || selector == 2 || selector == 3 ||
+                           selector == 4 || selector == 8;
+                }
+                return selector < 8;
+            case 0x00: case 0x01:
+                if (!executable_byte(cpu, pc, ++offset, &modrm)) {
+                    return false;
+                }
+                if (second == 0x00) {
+                    unsigned group = (modrm >> 3) & 7;
+                    return (group == 2 || group == 3) &&
+                           complete_modrm(cpu, pc, offset, modrm);
+                }
+                unsigned group = (modrm >> 3) & 7;
+                bool memory = (modrm & 0xc0) != 0xc0;
+                if (modrm == 0xc8 || modrm == 0xc9 ||
+                    (modrm == 0xd1 && (data_or_rep ||
+                     !(cpu->x86->env.features[FEAT_1_ECX] & CPUID_EXT_XSAVE)))) {
+                    return false;
+                }
+                bool service = (memory && (group == 2 || group == 3 || group == 7)) ||
+                               group == 6 || modrm == 0xf8 || modrm == 0xd1;
+                return service && complete_modrm(cpu, pc, offset, modrm);
+            default:
+                return false;
+            }
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
 static bool bridge_tlb_fill(CPUState *cs, vaddr address, int size,
                             MMUAccessType access_type, int mmu_idx,
                             bool probe, uintptr_t retaddr)
@@ -703,6 +837,10 @@ static int run_cpu(AnyPS5QemuCpu *cpu, uint64_t instruction_budget,
             }
         }
         if (cpu->pending) {
+            break;
+        }
+        if (application_service_instruction(cpu, cpu->x86->env.eip)) {
+            save_stop(cpu, ANYPS5_QEMU_UNSUPPORTED, 0, EXCP0D_GPF, 0);
             break;
         }
         cs->exception_index = -1;
