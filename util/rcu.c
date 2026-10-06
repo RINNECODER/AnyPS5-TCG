@@ -265,9 +265,13 @@ static void *call_rcu_thread(void *opaque)
         /* Heuristically wait for a decent number of callbacks to pile up.
          * Fetch rcu_call_count now, we only must process elements that were
          * added before synchronize_rcu() starts.
+         * An explicit drain must not wait for this batching heuristic.
          */
-        while (n == 0 || (n < RCU_CALL_MIN_SIZE && ++tries <= 5)) {
-            g_usleep(10000);
+        while (n == 0 || (n < RCU_CALL_MIN_SIZE &&
+                         !qatomic_read(&in_drain_call_rcu) && ++tries <= 5)) {
+            if (!qatomic_read(&in_drain_call_rcu)) {
+                g_usleep(10000);
+            }
             if (n == 0) {
                 qemu_event_reset(&rcu_call_ready_event);
                 n = qatomic_read(&rcu_call_count);
