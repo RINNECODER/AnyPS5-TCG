@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 typedef struct AnyPS5QemuCpu AnyPS5QemuCpu;
+typedef struct AnyPS5QemuContext AnyPS5QemuContext;
 
 enum AnyPS5QemuRegister {
     ANYPS5_QEMU_RAX, ANYPS5_QEMU_RCX, ANYPS5_QEMU_RDX, ANYPS5_QEMU_RBX,
@@ -47,6 +48,20 @@ typedef struct AnyPS5QemuRunResult {
 
 AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size);
 int anyps5_qemu_cpu_destroy(AnyPS5QemuCpu *cpu);
+/* Contexts capture supported user registers only, on the idle CPU owner.
+ * Creation captures the current state. Save replaces that snapshot; restore
+ * does not change the process profile, mappings, gates or stop request.
+ * Contexts belong to their creating CPU. A destroyed context is rejected while
+ * that CPU remains alive. CPU destruction expires the CPU and every context
+ * pointer; callers must not pass any of those pointers to this API afterward.
+ */
+int anyps5_qemu_cpu_context_create(AnyPS5QemuCpu *cpu,
+                                 AnyPS5QemuContext **context);
+int anyps5_qemu_cpu_context_save(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *context);
+int anyps5_qemu_cpu_context_restore(AnyPS5QemuCpu *cpu,
+                                  const AnyPS5QemuContext *context);
+int anyps5_qemu_cpu_context_destroy(AnyPS5QemuCpu *cpu,
+                                  AnyPS5QemuContext *context);
 int anyps5_qemu_cpu_map_borrowed(AnyPS5QemuCpu *cpu, uint64_t address,
                                void *backing, size_t size, unsigned permissions);
 /* Register the full stable, host-page-aligned allocation once, then alias it. */
