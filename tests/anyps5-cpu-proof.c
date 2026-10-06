@@ -54,6 +54,118 @@ static void run_to(AnyPS5QemuCpu *cpu, uint64_t start, uint64_t until)
             "one actual instruction reaches exact stop address");
 }
 
+static void verify_unmapped_gates(uint8_t *code, uint8_t *data, size_t size)
+{
+    char error[256] = {0};
+    AnyPS5QemuCpu *cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    AnyPS5QemuRunResult result;
+    uint64_t backing, stored;
+    const uint8_t replacement[] = {0x90,0x48,0x89,0x07};
+
+    require(cpu != NULL, "create gate lifetime proof CPU");
+    memcpy(code+0x1400, replacement, sizeof(replacement));
+    memset(data, 0xa5, 8);
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, code, size, &backing),
+              "register gate lifetime code backing");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x900000, backing, 0, 4096, 5),
+              "map old gated alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x910000, backing, 0, 4096, 5),
+              "map surviving gated alias");
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, 0xa00000, data, size, 3),
+              "map gate lifetime sentinel");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x900400, 80), "add old host gate");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x900fff, 83), "add last-byte host gate");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x910400, 81), "add surviving host gate");
+    require(anyps5_qemu_cpu_unmap(cpu, 0x900001) != 0,
+            "rejected unmap preserves existing alias and gates");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x900400);
+    result = run(cpu, 2);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 80 &&
+            result.instructions == 0, "old gate survives a rejected unmap");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x900000), "unmap old gated alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x900000, backing, 4096, 4096, 5),
+              "remap replacement guest code at old gate address");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0xa00000);
+    set_reg(cpu, ANYPS5_QEMU_RAX, UINT64_C(0x1122334455667788));
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x900400);
+    check_api(cpu, anyps5_qemu_cpu_run_until(cpu, 2, 0x900404, &result),
+              "execute replacement code at retired gate address");
+    fprintf(stderr, "remapped gate: stop=%u gate=%llu instructions=%llu rip=0x%llx\n",
+            result.reason, (unsigned long long)result.gate,
+            (unsigned long long)result.instructions, (unsigned long long)result.rip);
+    memcpy(&stored, data, sizeof(stored));
+    require(result.reason == ANYPS5_QEMU_STOP_ADDRESS && result.instructions == 2 &&
+            result.rip == 0x900404 && stored == UINT64_C(0x1122334455667788),
+            "successful unmap retires old gate so replacement NOP/store executes");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x900400, 82),
+              "register new gate at retired address");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, 0x900fff, 84),
+              "register new gate at retired last-byte address");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x900400);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 82 &&
+            result.instructions == 0, "replacement address dispatches only newly registered gate");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x900fff);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 84,
+            "unmap retires every gate including the final alias byte");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x910400);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 81 &&
+            result.instructions == 0, "successful unmap preserves gates outside removed alias");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy gate lifetime proof CPU");
+}
+
+static void verify_fresh_x87(uint8_t *code, uint8_t *data, size_t size)
+{
+    char error[256] = {0};
+    AnyPS5QemuCpu *cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    AnyPS5QemuRunResult result;
+    uint16_t control, status, tags;
+    uint64_t sum;
+    const uint8_t program[] = {
+        0xd9,0x37,                 /* FNSTENV [RDI], 28-byte environment */
+        0xd9,0xe8,                 /* FLD1 */
+        0xd9,0xe8,                 /* FLD1 */
+        0xde,0xc1,                 /* FADDP ST(1), ST(0) */
+        0xdd,0x5f,0x40,            /* FSTP qword [RDI+64] */
+        0x66,0xd9,0x77,0x60        /* FNSTENV [RDI+96], 14-byte environment */
+    };
+
+    require(cpu != NULL, "create fresh x87 proof CPU");
+    memcpy(code+0xc00, program, sizeof(program));
+    memset(data, 0xa5, 128);
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, 0x700000, code, size, 5),
+              "map fresh x87 code");
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, 0x800000, data, size, 3),
+              "map fresh x87 output");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x800000);
+    run_to(cpu, 0x700c00, 0x700c02);
+    memcpy(&control, data, sizeof(control));
+    memcpy(&status, data+4, sizeof(status));
+    memcpy(&tags, data+8, sizeof(tags));
+    fprintf(stderr, "fresh x87: control=0x%04x status=0x%04x tags=0x%04x\n",
+            control, status, tags);
+    require(tags == 0xffff,
+            "fresh guest FNSTENV reports all eight x87 registers empty");
+    require(control == 0x037f && status == 0,
+            "fresh guest x87 has default control and zero status/TOP");
+    check_api(cpu, anyps5_qemu_cpu_run_until(cpu, 5, 0x700c0f, &result),
+              "run actual fresh x87 arithmetic");
+    require(result.reason == ANYPS5_QEMU_STOP_ADDRESS &&
+            result.instructions == 5 && result.rip == 0x700c0f,
+            "two FLD1 loads, FADDP, FSTP and legacy FNSTENV retire exactly");
+    memcpy(&sum, data+64, sizeof(sum));
+    require(sum == UINT64_C(0x4000000000000000),
+            "actual fresh x87 addition stores independently expected double 2.0");
+    memcpy(&control, data+96, sizeof(control));
+    memcpy(&status, data+98, sizeof(status));
+    memcpy(&tags, data+100, sizeof(tags));
+    require(control == 0x037f && status == 0 && tags == 0xffff,
+            "legacy 14-byte FNSTENV reports empty stack and clean status after pop");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy fresh x87 proof CPU");
+}
+
 static void verify_aliases(uint8_t *code, uint8_t *data, size_t size)
 {
     char error[256] = {0};
@@ -320,10 +432,10 @@ static void verify_services(uint8_t *code, uint8_t *data, size_t size)
     check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy guarded-service CPU");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     char error[256] = {0};
-    AnyPS5QemuCpu *cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    AnyPS5QemuCpu *cpu;
     AnyPS5QemuRunResult result;
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t region_size = page < 16384 ? 16384 : page;
@@ -383,14 +495,29 @@ int main(void)
     const float zero_vector[8] = {0};
     uint64_t saved_components;
 
-    if (!cpu) {
-        fprintf(stderr, "FAIL: create CPU: %s\n", error);
-        return 1;
-    }
+    require(argc == 1 || (argc == 2 &&
+            (!strcmp(argv[1], "--fresh-x87") || !strcmp(argv[1], "--unmap-gates"))),
+            "usage: anyps5-cpu-proof [--fresh-x87|--unmap-gates]");
     require(posix_memalign((void **)&code, page, region_size) == 0, "code allocation");
     require(posix_memalign((void **)&data, page, region_size) == 0, "data allocation");
     memset(code, 0xcc, region_size);
     memset(data, 0xa5, region_size);
+    if (argc == 2) {
+        if (!strcmp(argv[1], "--fresh-x87")) {
+            verify_fresh_x87(code, data, region_size);
+        } else {
+            verify_unmapped_gates(code, data, region_size);
+        }
+        free(code);
+        free(data);
+        puts("PASS: selected native ARM64 TCG lifecycle regression");
+        return 0;
+    }
+    cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    if (!cpu) {
+        fprintf(stderr, "FAIL: create CPU: %s\n", error);
+        return 1;
+    }
     memcpy(code, avx256, sizeof(avx256));
     memcpy(code+0x100, avx128, sizeof(avx128));
     memcpy(code+0x200, host_call, sizeof(host_call));
@@ -615,8 +742,10 @@ int main(void)
     }
     verify_aliases(code, data, region_size);
     verify_services(code, data, region_size);
+    verify_fresh_x87(code, data, region_size);
+    verify_unmapped_gates(code, data, region_size);
     free(code);
     free(data);
-    puts("PASS: native ARM64 TCG vectors/state, shared aliases, protection/coherence/TLS, lifecycle and every-step service guard");
+    puts("PASS: native ARM64 TCG vectors/state, fresh x87, shared aliases, protection/coherence/TLS, lifecycle and every-step service guard");
     return 0;
 }

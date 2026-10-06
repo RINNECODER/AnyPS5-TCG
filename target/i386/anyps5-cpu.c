@@ -437,6 +437,9 @@ AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
     env->segs[R_SS].selector = 0x2b;
     cpu->x86->phys_bits = 48;
     cpu_init_fp_statuses(env);
+    for (unsigned i = 0; i < 8; i++) {
+        env->fptags[i] = 1;
+    }
     cpu_set_fpuc(env, 0x37f);
     cpu_set_mxcsr(env, 0x1f80);
     bql_unlock();
@@ -599,6 +602,16 @@ int anyps5_qemu_cpu_unmap(AnyPS5QemuCpu *cpu, uint64_t address)
                 (cpu->range_count - i - 1) * sizeof(cpu->ranges[0]));
         cpu->range_count--;
         range->backing->aliases--;
+        size_t remaining_gates = 0;
+        for (size_t j = 0; j < cpu->gate_count; j++) {
+            uint64_t gate_address = cpu->gates[j].address;
+            if (gate_address >= range->address &&
+                gate_address - range->address < range->size) {
+                continue;
+            }
+            cpu->gates[remaining_gates++] = cpu->gates[j];
+        }
+        cpu->gate_count = remaining_gates;
         bql_unlock();
         /* FlatView callbacks still dereference embedded MemoryRegion storage. */
         drain_call_rcu();
