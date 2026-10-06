@@ -30,6 +30,32 @@
 #define ANYPS5_MAX_RANGES 256
 #define ANYPS5_MAX_GATES 256
 #define ANYPS5_MAX_BACKINGS 256
+/* Architectural segment/flags state which may vary within the fixed profile. */
+#define ANYPS5_CONTEXT_HFLAGS (HF_INHIBIT_IRQ_MASK | HF_SS32_MASK | \
+                               HF_ADDSEG_MASK | HF_TF_MASK | HF_RF_MASK | \
+                               HF_AC_MASK)
+
+typedef struct AnyPS5QemuUserState {
+    target_ulong regs[CPU_NB_REGS];
+    target_ulong rip;
+    target_ulong rflags;
+    SegmentCache segs[6];
+    uint32_t user_hflags;
+    unsigned fpstt;
+    uint16_t fpus, fpuc, fpop, fpcs, fpds;
+    uint64_t fpip, fpdp;
+    uint8_t fptags[8];
+    FPReg fpregs[8];
+    uint8_t ymm[16][32];
+    uint32_t mxcsr;
+    /* These softfloat structures contain scalars, enums and bools, no pointers. */
+    float_status fp_status, mmx_status, sse_status;
+} AnyPS5QemuUserState;
+
+struct AnyPS5QemuContext {
+    AnyPS5QemuUserState *state;
+    AnyPS5QemuContext *next;
+};
 
 typedef struct AnyPS5QemuBacking {
     uint64_t id;
@@ -73,6 +99,9 @@ struct AnyPS5QemuCpu {
     bool pending;
     bool running;
     bool requested_stop;
+    AnyPS5QemuContext *contexts;
+    SegmentCache context_cs, context_ss;
+    uint32_t context_profile_hflags;
     char error[256];
 };
 
@@ -91,6 +120,211 @@ static int fail(AnyPS5QemuCpu *cpu, const char *message)
 static bool on_owner(AnyPS5QemuCpu *cpu)
 {
     return cpu && active_cpu == cpu && qemu_thread_is_self(&cpu->owner);
+}
+
+static bool same_segment(const SegmentCache *a, const SegmentCache *b)
+{
+    return a->selector == b->selector && a->base == b->base &&
+           a->limit == b->limit && a->flags == b->flags;
+}
+
+static bool context_profile(AnyPS5QemuCpu *cpu)
+{
+    CPUX86State *env = &cpu->x86->env;
+
+    return env->cr[0] == (CR0_PE_MASK | CR0_ET_MASK) &&
+           env->cr[4] == (CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK |
+                          CR4_OSXSAVE_MASK) &&
+           env->efer == (MSR_EFER_LME | MSR_EFER_LMA | MSR_EFER_SCE) &&
+           env->xcr0 == (XSTATE_FP_MASK | XSTATE_SSE_MASK | XSTATE_YMM_MASK) &&
+           (env->hflags & ~ANYPS5_CONTEXT_HFLAGS) ==
+               cpu->context_profile_hflags &&
+           env->hflags2 == HF2_GIF_MASK &&
+           !(env->eflags & (IOPL_MASK | VM_MASK | VIF_MASK | VIP_MASK)) &&
+           same_segment(&env->segs[R_CS], &cpu->context_cs) &&
+           same_segment(&env->segs[R_SS], &cpu->context_ss);
+}
+
+static int context_idle(AnyPS5QemuCpu *cpu)
+{
+    /* Reject a non-current CPU without dereferencing it for an error.
+     * Callers must not reuse CPU/context pointers after CPU destruction.
+     */
+    if (!on_owner(cpu)) {
+        return fail(NULL, "Context access requires its CPU owner thread");
+    }
+    if (cpu->running) {
+        return fail(cpu, "Context access requires the idle CPU owner");
+    }
+    return 0;
+}
+
+static AnyPS5QemuContext *find_context(AnyPS5QemuCpu *cpu,
+                                     const AnyPS5QemuContext *context)
+{
+    for (AnyPS5QemuContext *entry = cpu->contexts; entry; entry = entry->next) {
+        if (entry == context) {
+            return entry->state ? entry : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void capture_context(AnyPS5QemuCpu *cpu, AnyPS5QemuUserState *state)
+{
+    CPUX86State *env = &cpu->x86->env;
+
+    memcpy(state->regs, env->regs, sizeof(state->regs));
+    state->rip = env->eip;
+    /* cpu_exec exit already materializes CC/DF. Public Set may replace it. */
+    state->rflags = env->eflags | 2;
+    memcpy(state->segs, env->segs, sizeof(state->segs));
+    state->user_hflags = env->hflags & ANYPS5_CONTEXT_HFLAGS;
+    state->fpstt = env->fpstt;
+    state->fpus = env->fpus;
+    state->fpuc = env->fpuc;
+    state->fpop = env->fpop;
+    state->fpcs = env->fpcs;
+    state->fpds = env->fpds;
+    state->fpip = env->fpip;
+    state->fpdp = env->fpdp;
+    memcpy(state->fptags, env->fptags, sizeof(state->fptags));
+    /* Physical slots preserve x87 TOP/tags and the aliased MMX bits. */
+    memcpy(state->fpregs, env->fpregs, sizeof(state->fpregs));
+    for (unsigned i = 0; i < 16; i++) {
+        memcpy(state->ymm[i], &env->xmm_regs[i], 32);
+    }
+    state->mxcsr = env->mxcsr;
+    state->fp_status = env->fp_status;
+    state->mmx_status = env->mmx_status;
+    state->sse_status = env->sse_status;
+}
+
+int anyps5_qemu_cpu_context_create(AnyPS5QemuCpu *cpu,
+                                 AnyPS5QemuContext **context)
+{
+    AnyPS5QemuContext *entry;
+
+    if (context_idle(cpu)) {
+        return -1;
+    }
+    if (!context || !context_profile(cpu)) {
+        return fail(cpu, "Context creation requires an output and fixed application profile");
+    }
+    entry = g_try_new0(AnyPS5QemuContext, 1);
+    if (!entry) {
+        return fail(cpu, "Cannot allocate guest context");
+    }
+    entry->state = g_try_new0(AnyPS5QemuUserState, 1);
+    if (!entry->state) {
+        g_free(entry);
+        return fail(cpu, "Cannot allocate guest register state");
+    }
+    capture_context(cpu, entry->state);
+    entry->next = cpu->contexts;
+    cpu->contexts = entry;
+    *context = entry;
+    return 0;
+}
+
+int anyps5_qemu_cpu_context_save(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *context)
+{
+    AnyPS5QemuContext *entry;
+
+    if (context_idle(cpu)) {
+        return -1;
+    }
+    entry = find_context(cpu, context);
+    if (!entry || !context_profile(cpu)) {
+        return fail(cpu, "Context save requires a live CPU-owned context and fixed profile");
+    }
+    capture_context(cpu, entry->state);
+    return 0;
+}
+
+int anyps5_qemu_cpu_context_restore(AnyPS5QemuCpu *cpu,
+                                  const AnyPS5QemuContext *context)
+{
+    AnyPS5QemuContext *entry;
+    const AnyPS5QemuUserState *state;
+    CPUX86State *env;
+
+    if (context_idle(cpu)) {
+        return -1;
+    }
+    entry = find_context(cpu, context);
+    if (!entry || !context_profile(cpu)) {
+        return fail(cpu, "Context restore requires a live CPU-owned context and fixed profile");
+    }
+    state = entry->state;
+    if (!same_segment(&state->segs[R_CS], &cpu->context_cs) ||
+        !same_segment(&state->segs[R_SS], &cpu->context_ss) ||
+        (state->user_hflags & ~ANYPS5_CONTEXT_HFLAGS) || state->fpstt >= 8 ||
+        !(state->rflags & 2) ||
+        (state->rflags & (IOPL_MASK | VM_MASK | VIF_MASK | VIP_MASK)) ||
+        (state->mxcsr & ~0xffffu)) {
+        return fail(cpu, "Invalid saved guest architectural state");
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        if (state->fptags[i] > 1) {
+            return fail(cpu, "Invalid saved x87 tag state");
+        }
+    }
+    env = &cpu->x86->env;
+    memcpy(env->regs, state->regs, sizeof(state->regs));
+    env->eip = state->rip;
+    env->eflags = state->rflags;
+    env->cc_src = state->rflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
+    env->cc_dst = env->cc_src2 = 0;
+    env->cc_op = CC_OP_EFLAGS;
+    env->df = 1 - 2 * ((state->rflags >> 10) & 1);
+    /* The bridge's initial CS/SS descriptors are not hardware reset caches.
+     * Restore caches with their validated user hflags, without reloading CS/SS
+     * through load_seg_cache, which would change this fixed CPL3/64-bit mode.
+     */
+    memcpy(env->segs, state->segs, sizeof(state->segs));
+    env->hflags = cpu->context_profile_hflags | state->user_hflags;
+    env->fpstt = state->fpstt;
+    env->fpus = state->fpus;
+    cpu_set_fpuc(env, state->fpuc);
+    env->fpop = state->fpop;
+    env->fpcs = state->fpcs;
+    env->fpds = state->fpds;
+    env->fpip = state->fpip;
+    env->fpdp = state->fpdp;
+    memcpy(env->fptags, state->fptags, sizeof(state->fptags));
+    memcpy(env->fpregs, state->fpregs, sizeof(state->fpregs));
+    for (unsigned i = 0; i < 16; i++) {
+        memcpy(&env->xmm_regs[i], state->ymm[i], 32);
+    }
+    cpu_set_mxcsr(env, state->mxcsr);
+    /* Control helpers set derived rounding/DAZ/FTZ but clear accrued flags.
+     * The complete pointer-free status retains all pending exception bits.
+     */
+    env->fp_status = state->fp_status;
+    env->mmx_status = state->mmx_status;
+    env->sse_status = state->sse_status;
+    return 0;
+}
+
+int anyps5_qemu_cpu_context_destroy(AnyPS5QemuCpu *cpu,
+                                  AnyPS5QemuContext *context)
+{
+    AnyPS5QemuContext *entry;
+
+    if (context_idle(cpu)) {
+        return -1;
+    }
+    entry = find_context(cpu, context);
+    if (!entry) {
+        return fail(cpu, "Context destruction requires a live CPU-owned context");
+    }
+    g_free(entry->state);
+    entry->state = NULL;
+    /* Keep the small handle until CPU destruction, preventing address reuse
+     * from accepting a retired context during this CPU's lifetime.
+     */
+    return 0;
 }
 
 static AnyPS5QemuRange *find_range(AnyPS5QemuCpu *cpu, uint64_t address,
@@ -498,6 +732,9 @@ AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
     }
     cpu_set_fpuc(env, 0x37f);
     cpu_set_mxcsr(env, 0x1f80);
+    cpu->context_cs = env->segs[R_CS];
+    cpu->context_ss = env->segs[R_SS];
+    cpu->context_profile_hflags = env->hflags & ~ANYPS5_CONTEXT_HFLAGS;
     bql_unlock();
     return cpu;
 }
@@ -1168,6 +1405,15 @@ static int run_cpu(AnyPS5QemuCpu *cpu, uint64_t instruction_budget,
             }
             break;
         }
+        if (reason == EXCP_INTERRUPT) {
+            /* Pair with stop's publication before cpu_exit sets exit_request. */
+            smp_rmb();
+            if (qatomic_read(&cpu->requested_stop)) {
+                /* An interrupted iteration has not retired an instruction. */
+                cpu->stopped.reason = ANYPS5_QEMU_REQUESTED_STOP;
+                break;
+            }
+        }
         if (reason != EXCP_DEBUG) {
             save_stop(cpu, ANYPS5_QEMU_UNSUPPORTED, 0, reason, 0);
             break;
@@ -1204,6 +1450,8 @@ void anyps5_qemu_cpu_stop(AnyPS5QemuCpu *cpu)
 {
     if (cpu && active_cpu == cpu) {
         qatomic_set(&cpu->requested_stop, true);
+        /* Publish the bridge reason before QEMU can observe exit_request. */
+        smp_wmb();
         cpu_exit(CPU(cpu->x86));
     }
 }
@@ -1239,6 +1487,12 @@ int anyps5_qemu_cpu_destroy(AnyPS5QemuCpu *cpu)
         if (anyps5_qemu_cpu_release_backing(cpu, cpu->backings[0]->id)) {
             return -1;
         }
+    }
+    while (cpu->contexts) {
+        AnyPS5QemuContext *context = cpu->contexts;
+        cpu->contexts = context->next;
+        g_free(context->state);
+        g_free(context);
     }
     cs = CPU(cpu->x86);
     bql_lock();

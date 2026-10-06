@@ -1,6 +1,10 @@
 {
   anyps5_qemu_cpu_create;
   anyps5_qemu_cpu_destroy;
+  anyps5_qemu_cpu_context_create;
+  anyps5_qemu_cpu_context_save;
+  anyps5_qemu_cpu_context_restore;
+  anyps5_qemu_cpu_context_destroy;
   anyps5_qemu_cpu_map_borrowed;
   anyps5_qemu_cpu_register_backing;
   anyps5_qemu_cpu_release_backing;
