@@ -1,4 +1,5 @@
 #include "qemu/anyps5-cpu.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,227 @@ static void run_to(AnyPS5QemuCpu *cpu, uint64_t start, uint64_t until)
     require(result.reason == ANYPS5_QEMU_STOP_ADDRESS &&
             result.instructions == 1 && result.rip == until,
             "one actual instruction reaches exact stop address");
+}
+
+static void verify_range_changes(uint8_t *code, uint8_t *data, size_t size)
+{
+    const uint64_t base = UINT64_C(0x1000000000);
+    const uint64_t target = base + 4096;
+    const uint64_t value = UINT64_C(0x1122334455667788);
+    const uint8_t load[] = {0x48,0x8b,0x07};
+    const uint8_t store[] = {0x48,0x89,0x07};
+    const uint8_t old_code[] = {0xb8,1,0,0,0};
+    const uint8_t new_code[] = {0x90,0x48,0x89,0x07};
+    const uint8_t removed_code[] = {0xb8,9,0,0,0};
+    char error[256] = {0};
+    AnyPS5QemuCpu *cpu;
+    AnyPS5QemuRunResult result;
+    uint64_t code_id, old_id, new_id, rejected_id, observed;
+    uint8_t *replacement = NULL, *snapshot = malloc(size);
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    require(snapshot != NULL &&
+            posix_memalign((void **)&replacement, page, size) == 0,
+            "allocate stable range replacement and independent snapshot");
+    memset(data, 0x23, size);
+    memset(replacement, 0xe7, size);
+    memcpy(code+0xd00, load, sizeof(load));
+    memcpy(code+0xd10, store, sizeof(store));
+    memcpy(data+4096+128, old_code, sizeof(old_code));
+    memcpy(replacement+4096+128, new_code, sizeof(new_code));
+    memcpy(replacement+8192+128, removed_code, sizeof(removed_code));
+    memcpy(replacement+4096, &value, sizeof(value));
+    memcpy(snapshot, data, size);
+    cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    require(cpu != NULL, "create range replacement proof CPU");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, code, size, &code_id), "register range code");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &old_id), "register reserved physical backing");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, replacement, size, &new_id), "register replacement physical backing");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0xb00000, code_id, 0, 4096, 5), "map range proof instructions");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, base, old_id, 0, 16384, 7), "map four-page original alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0xc00000, new_id, 4096, 8192, 3), "map peer replacement alias");
+    run_to(cpu, target+128, target+133);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 1, "prime translation for original physical code");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, target+128, 100), "add replaced interval gate");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, base+12288+128, 102), "add retained right-fragment gate");
+    check_api(cpu, anyps5_qemu_cpu_protect_range(cpu, base, 4096, 1), "protect retained left fragment read-only");
+    check_api(cpu, anyps5_qemu_cpu_protect_range(cpu, base+12288, 4096, 4), "protect retained right fragment execute-only");
+    check_api(cpu, anyps5_qemu_cpu_protect_range(cpu, target, 8192, 0), "reserve middle pages with PROT_NONE");
+    set_reg(cpu, ANYPS5_QEMU_RDI, target);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0xb00d00);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == target && result.instructions == 0,
+            "PROT_NONE reservation is inaccessible before replacement");
+    check_api(cpu, anyps5_qemu_cpu_replace_alias(cpu, target, new_id, 4096, 8192, 7),
+              "atomically replace reserved middle pages with stable backing");
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == value,
+            "replacement load observes correct physical backing offset");
+    set_reg(cpu, ANYPS5_QEMU_RDI, target+256);
+    set_reg(cpu, ANYPS5_QEMU_RAX, value);
+    set_reg(cpu, ANYPS5_QEMU_RIP, target+128);
+    check_api(cpu, anyps5_qemu_cpu_run_until(cpu, 2, target+132, &result), "execute newly replaced physical code");
+    memcpy(&observed, replacement+4096+256, sizeof(observed));
+    require(result.reason == ANYPS5_QEMU_STOP_ADDRESS && result.instructions == 2 &&
+            result.rip == target+132 && observed == value,
+            "replacement retires old gate/cache and executes actual NOP/store");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0xc00100);
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == value && !memcmp(snapshot, data, size),
+            "peer alias shares replacement writes while original physical bytes stay intact");
+    set_reg(cpu, ANYPS5_QEMU_RDI, base+16);
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == UINT64_C(0x2323232323232323),
+            "retained left fragment keeps original backing offset");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0xb00d10);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.address == base+16 &&
+            !memcmp(snapshot, data, size), "retained left fragment keeps read-only protection");
+    set_reg(cpu, ANYPS5_QEMU_RDI, base+12288+16);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0xb00d00);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.address == base+12288+16,
+            "retained right fragment keeps execute-only protection");
+    set_reg(cpu, ANYPS5_QEMU_RIP, base+12288+128);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 102,
+            "replacement preserves gates outside target interval");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, target+128, 103), "register new replacement gate");
+    run_to(cpu, target+4096+128, target+4096+133);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 9, "prime code in page to be removed");
+    check_api(cpu, anyps5_qemu_cpu_add_gate(cpu, target+4096+128, 104), "add removed-page gate");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, target+4096, 4096), "partially unmap replacement alias");
+    set_reg(cpu, ANYPS5_QEMU_RDI, target+4096);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0xb00d00);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == target+4096 && result.instructions == 0,
+            "partial unmap revokes cached data access in exact guest page");
+    set_reg(cpu, ANYPS5_QEMU_RAX, value);
+    set_reg(cpu, ANYPS5_QEMU_RIP, target+4096+128);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.rip == target+4096+128 && get_reg(cpu, ANYPS5_QEMU_RAX) == value,
+            "partial unmap revokes cached code without executing stale translation");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0xc01000+128);
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    memcpy(&observed, replacement+8192+128, sizeof(observed));
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == observed,
+            "unmapping one logical alias preserves shared physical backing and peer alias");
+    struct {
+        uint64_t address, backing;
+        size_t offset, length;
+        unsigned permissions;
+        bool replace;
+    } invalid[] = {
+        {base, 0, 0, 16384, 0, false},             /* internal hole */
+        {base, new_id, 0, 16384, 3, true},
+        {target+1, 0, 0, 4096, 0, false},
+        {target, 0, 0, 0, 0, false},
+        {target, 0, 0, 4095, 0, false},
+        {UINT64_C(0x7ffffffff000), 0, 0, 8192, 0, false},
+        {UINT64_MAX-4095, 0, 0, 8192, 0, false},
+        {target, UINT64_MAX, 0, 4096, 3, true},
+        {target, new_id, 1, 4096, 3, true},
+        {target, new_id, size, 4096, 3, true},
+        {target, new_id, 0, 4096, 8, true}
+    };
+    for (unsigned i = 0; i < sizeof(invalid)/sizeof(invalid[0]); i++) {
+        int rejected = invalid[i].replace ? anyps5_qemu_cpu_replace_alias(cpu,
+            invalid[i].address, invalid[i].backing, invalid[i].offset,
+            invalid[i].length, invalid[i].permissions) :
+            anyps5_qemu_cpu_unmap_range(cpu, invalid[i].address, invalid[i].length);
+        require(rejected != 0, "invalid range change fails before mutation");
+        set_reg(cpu, ANYPS5_QEMU_RDI, target+256);
+        run_to(cpu, 0xb00d00, 0xb00d03);
+        require(get_reg(cpu, ANYPS5_QEMU_RAX) == value && !memcmp(snapshot, data, size),
+                "rejected range changes preserve guest mapping and original physical bytes");
+        set_reg(cpu, ANYPS5_QEMU_RIP, target+128);
+        result = run(cpu, 1);
+        require(result.reason == ANYPS5_QEMU_HOST_GATE && result.gate == 103,
+                "rejected range changes preserve registered gate");
+    }
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, target+4096, new_id, 8192, 4096, 7), "remap removed logical page");
+    run_to(cpu, target+4096+128, target+4096+133);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 9, "unmap retires only removed-page gate");
+    /* Coverage may span several independently retained alias fragments. */
+    check_api(cpu, anyps5_qemu_cpu_replace_alias(cpu, base, new_id, 0, 16384, 3), "replace covered range spanning four aliases");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, old_id), "explicit original backing remains releasable after final replacement");
+    require(anyps5_qemu_cpu_release_backing(cpu, new_id) != 0,
+            "replacement and peer aliases keep backing registration alive");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base+4096, 8192), "remove middle of replacement leaving both fragments");
+    set_reg(cpu, ANYPS5_QEMU_RDI, base+12288+16);
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    memcpy(&observed, replacement+12288+16, sizeof(observed));
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == observed,
+            "right fragment from middle removal retains correct original physical offset");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base, 4096), "remove retained left fragment");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base+12288, 4096), "remove retained right fragment");
+    require(anyps5_qemu_cpu_release_backing(cpu, new_id) != 0, "peer alias still owns backing lifetime");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, 0xc00000, 8192), "remove final peer alias");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, new_id), "release explicit backing after all alias fragments");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy range replacement proof CPU");
+
+    cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    require(cpu != NULL, "create alias capacity proof CPU");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, code, size, &code_id), "register capacity code");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &old_id), "register capacity data");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0xb00000, code_id, 0, 4096, 5), "map capacity proof code");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, base, old_id, 0, 12288, 3), "map capacity source span");
+    for (unsigned i = 0; i < 254; i++) {
+        check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0xd00000+(uint64_t)i*4096, old_id, 0, 4096, 3), "fill alias capacity");
+    }
+    require(anyps5_qemu_cpu_unmap_range(cpu, base+4096, 4096) != 0 &&
+            anyps5_qemu_cpu_replace_alias(cpu, base+4096, old_id, 0, 4096, 3) != 0,
+            "split exceeding final alias capacity rejects both operations atomically");
+    for (unsigned i = 0; i < 3; i++) {
+        set_reg(cpu, ANYPS5_QEMU_RDI, base+(uint64_t)i*4096+16);
+        run_to(cpu, 0xb00d00, 0xb00d03);
+        require(get_reg(cpu, ANYPS5_QEMU_RAX) == UINT64_C(0x2323232323232323),
+                "capacity rejection preserves every source page");
+    }
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy alias capacity proof CPU");
+
+    cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    require(cpu != NULL, "create automatic backing lifetime proof CPU");
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, base, data, size, 0), "map automatic reserved backing");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base+4096, 4096), "split automatic reserved backing");
+    require(anyps5_qemu_cpu_register_backing(cpu, data, size, &rejected_id) != 0,
+            "automatic backing stays registered while both fragments remain");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base, 4096), "remove first automatic fragment");
+    require(anyps5_qemu_cpu_register_backing(cpu, data, size, &rejected_id) != 0,
+            "automatic backing stays registered while last fragment remains");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base+8192, size-8192), "remove final automatic fragment");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &old_id),
+              "automatic backing is released after its final fragment");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, old_id), "release re-registered backing");
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, base, data, size, 0),
+              "map another automatic reservation for whole replacement");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, replacement, size, &new_id),
+              "register explicit whole-reservation replacement backing");
+    check_api(cpu, anyps5_qemu_cpu_map_borrowed(cpu, 0xb00000, code, size, 5),
+              "map automatic replacement proof instructions");
+    check_api(cpu, anyps5_qemu_cpu_replace_alias(cpu, base, new_id, 0, size, 3),
+              "replace entire automatic PROT_NONE reservation");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &old_id),
+              "whole replacement releases old automatic host registration");
+    set_reg(cpu, ANYPS5_QEMU_RDI, base+256);
+    run_to(cpu, 0xb00d00, 0xb00d03);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == UINT64_C(0xe7e7e7e7e7e7e7e7),
+            "whole replacement executes guest load from new explicit physical backing");
+    set_reg(cpu, ANYPS5_QEMU_RAX, value);
+    run_to(cpu, 0xb00d10, 0xb00d13);
+    memcpy(&observed, replacement+256, sizeof(observed));
+    require(observed == value && !memcmp(snapshot, data, size),
+            "whole replacement guest store changes only new physical backing");
+    require(anyps5_qemu_cpu_release_backing(cpu, new_id) != 0,
+            "whole replacement keeps explicit backing alive while aliased");
+    check_api(cpu, anyps5_qemu_cpu_unmap_range(cpu, base, size), "unmap whole explicit replacement");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, new_id), "release whole replacement backing explicitly");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, old_id), "release old re-registered host allocation");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy automatic backing proof CPU");
+    free(snapshot);
+    free(replacement);
 }
 
 static void verify_unmapped_gates(uint8_t *code, uint8_t *data, size_t size)
@@ -496,8 +718,9 @@ int main(int argc, char **argv)
     uint64_t saved_components;
 
     require(argc == 1 || (argc == 2 &&
-            (!strcmp(argv[1], "--fresh-x87") || !strcmp(argv[1], "--unmap-gates"))),
-            "usage: anyps5-cpu-proof [--fresh-x87|--unmap-gates]");
+            (!strcmp(argv[1], "--fresh-x87") || !strcmp(argv[1], "--unmap-gates") ||
+             !strcmp(argv[1], "--range-memory"))),
+            "usage: anyps5-cpu-proof [--fresh-x87|--unmap-gates|--range-memory]");
     require(posix_memalign((void **)&code, page, region_size) == 0, "code allocation");
     require(posix_memalign((void **)&data, page, region_size) == 0, "data allocation");
     memset(code, 0xcc, region_size);
@@ -505,8 +728,10 @@ int main(int argc, char **argv)
     if (argc == 2) {
         if (!strcmp(argv[1], "--fresh-x87")) {
             verify_fresh_x87(code, data, region_size);
-        } else {
+        } else if (!strcmp(argv[1], "--unmap-gates")) {
             verify_unmapped_gates(code, data, region_size);
+        } else {
+            verify_range_changes(code, data, region_size);
         }
         free(code);
         free(data);
@@ -744,8 +969,9 @@ int main(int argc, char **argv)
     verify_services(code, data, region_size);
     verify_fresh_x87(code, data, region_size);
     verify_unmapped_gates(code, data, region_size);
+    verify_range_changes(code, data, region_size);
     free(code);
     free(data);
-    puts("PASS: native ARM64 TCG vectors/state, fresh x87, shared aliases, protection/coherence/TLS, lifecycle and every-step service guard");
+    puts("PASS: native ARM64 TCG vectors/state, fresh x87, shared aliases/range replacement, protection/coherence/TLS, lifecycle and every-step service guard");
     return 0;
 }

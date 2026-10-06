@@ -656,6 +656,186 @@ static void append_protection(GArray *array, AnyPS5QemuProtection p)
     g_array_append_val(array, p);
 }
 
+static AnyPS5QemuRange *retain_fragment(AnyPS5QemuRange *source,
+                                       uint64_t address, size_t size)
+{
+    AnyPS5QemuRange *fragment = g_new0(AnyPS5QemuRange, 1);
+    size_t first = address - source->address;
+    size_t last = first + size;
+
+    fragment->address = address;
+    fragment->size = size;
+    fragment->backing = source->backing;
+    fragment->protections = g_array_new(false, false,
+                                        sizeof(AnyPS5QemuProtection));
+    for (size_t i = 0; i < source->protections->len; i++) {
+        AnyPS5QemuProtection p = g_array_index(source->protections,
+                                              AnyPS5QemuProtection, i);
+        size_t start = MAX(first, p.offset);
+        size_t end = MIN(last, p.offset + p.size);
+        if (start < end) {
+            append_protection(fragment->protections, (AnyPS5QemuProtection) {
+                start - first, end - start, p.permissions });
+        }
+    }
+    return fragment;
+}
+
+static int change_guest_range(AnyPS5QemuCpu *cpu, uint64_t address, size_t size,
+                              bool replace, uint64_t backing_id, size_t offset,
+                              unsigned permissions)
+{
+    AnyPS5QemuRange *updated[ANYPS5_MAX_RANGES];
+    AnyPS5QemuRange *removed[ANYPS5_MAX_RANGES];
+    size_t physical_offsets[ANYPS5_MAX_RANGES];
+    bool added[ANYPS5_MAX_RANGES];
+    size_t needed = replace ? 1 : 0, count = 0, removed_count = 0;
+    AnyPS5QemuBacking *backing = NULL;
+    CPUState *cs;
+    QemuCond *halt_cond;
+    uint64_t end;
+
+    if (!on_owner(cpu) || cpu->running || !size ||
+        address >= 0x800000000000ULL || size > 0x800000000000ULL - address ||
+        address % TARGET_PAGE_SIZE || size % TARGET_PAGE_SIZE) {
+        return fail(cpu, "Range change requires the idle owner and aligned guest pages");
+    }
+    if (replace) {
+        backing = find_backing(cpu, backing_id);
+        if (!backing || offset % TARGET_PAGE_SIZE ||
+            offset > backing->size || size > backing->size - offset ||
+            (permissions & ~7u)) {
+            return fail(cpu, "Invalid replacement backing extent or permissions");
+        }
+    }
+    end = address + size;
+    /* PROT_NONE is owned memory, not a hole. Preflight every covered alias. */
+    for (uint64_t cursor = address; cursor < end; ) {
+        AnyPS5QemuRange *range = find_range(cpu, cursor, 1);
+        if (!range) {
+            return fail(cpu, "Range change includes unmapped guest memory");
+        }
+        cursor = MIN(end, range->address + range->size);
+    }
+    for (size_t i = 0; i < cpu->range_count; i++) {
+        AnyPS5QemuRange *range = cpu->ranges[i];
+        uint64_t range_end = range->address + range->size;
+        if (address >= range_end || range->address >= end) {
+            needed++;
+        } else {
+            needed += range->address < address;
+            needed += range_end > end;
+        }
+    }
+    if (needed > ANYPS5_MAX_RANGES) {
+        return fail(cpu, "Range change exceeds guest alias capacity");
+    }
+    /* Allocate metadata before touching MemoryRegions or backing references. */
+    for (size_t i = 0; i < cpu->range_count; i++) {
+        AnyPS5QemuRange *range = cpu->ranges[i];
+        uint64_t range_end = range->address + range->size;
+        if (address >= range_end || range->address >= end) {
+            updated[count] = range;
+            added[count++] = false;
+            continue;
+        }
+        removed[removed_count++] = range;
+        if (range->address < address) {
+            updated[count] = retain_fragment(range, range->address,
+                                              address - range->address);
+            physical_offsets[count] = range->region.alias_offset;
+            added[count++] = true;
+        }
+        if (range_end > end) {
+            updated[count] = retain_fragment(range, end, range_end - end);
+            physical_offsets[count] = range->region.alias_offset +
+                                      end - range->address;
+            added[count++] = true;
+        }
+    }
+    if (replace) {
+        AnyPS5QemuProtection p = { 0, size, permissions };
+        AnyPS5QemuRange *range = g_new0(AnyPS5QemuRange, 1);
+        range->address = address;
+        range->size = size;
+        range->backing = backing;
+        range->protections = g_array_new(false, false, sizeof(p));
+        g_array_append_val(range->protections, p);
+        updated[count] = range;
+        physical_offsets[count] = offset;
+        added[count++] = true;
+    }
+    cs = CPU(cpu->x86);
+    bql_lock();
+    halt_cond = cs->halt_cond;
+    cs->halt_cond = NULL;
+    memory_region_transaction_begin();
+    for (size_t i = 0; i < removed_count; i++) {
+        memory_region_del_subregion(get_system_memory(), &removed[i]->region);
+        removed[i]->backing->aliases--;
+    }
+    for (size_t i = 0; i < count; i++) {
+        AnyPS5QemuRange *range = updated[i];
+        if (!added[i]) {
+            continue;
+        }
+        memory_region_init_alias(&range->region, OBJECT(cpu->x86),
+                                 "anyps5-alias", &range->backing->region,
+                                 physical_offsets[i], range->size);
+        memory_region_add_subregion(get_system_memory(), range->address,
+                                     &range->region);
+        range->backing->aliases++;
+    }
+    memcpy(cpu->ranges, updated, count * sizeof(updated[0]));
+    cpu->range_count = count;
+    memory_region_transaction_commit();
+    for (size_t i = 0; i < removed_count; i++) {
+        object_unparent(OBJECT(&removed[i]->region));
+    }
+    size_t remaining_gates = 0;
+    for (size_t i = 0; i < cpu->gate_count; i++) {
+        if (cpu->gates[i].address >= address &&
+            cpu->gates[i].address - address < size) {
+            continue;
+        }
+        cpu->gates[remaining_gates++] = cpu->gates[i];
+    }
+    cpu->gate_count = remaining_gates;
+    cs->halt_cond = halt_cond;
+    tlb_flush(cs);
+    tb_flush(cs);
+    bql_unlock();
+    /* Old FlatViews can refer to the embedded regions until RCU quiesces. */
+    drain_call_rcu();
+    for (size_t i = 0; i < removed_count; i++) {
+        g_array_free(removed[i]->protections, true);
+        g_free(removed[i]);
+    }
+    for (size_t i = 0; i < cpu->backing_count; ) {
+        AnyPS5QemuBacking *old = cpu->backings[i];
+        if (old->automatic && !old->aliases) {
+            int result = anyps5_qemu_cpu_release_backing(cpu, old->id);
+            g_assert(result == 0);
+        } else {
+            i++;
+        }
+    }
+    return 0;
+}
+
+int anyps5_qemu_cpu_unmap_range(AnyPS5QemuCpu *cpu, uint64_t address, size_t size)
+{
+    return change_guest_range(cpu, address, size, false, 0, 0, 0);
+}
+
+int anyps5_qemu_cpu_replace_alias(AnyPS5QemuCpu *cpu, uint64_t address,
+                                uint64_t backing_id, size_t offset, size_t size,
+                                unsigned permissions)
+{
+    return change_guest_range(cpu, address, size, true, backing_id, offset,
+                              permissions);
+}
+
 int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
                                 size_t size, unsigned permissions)
 {
