@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "anyps5-cpu-internal.h"
 #include "helper-tcg.h"
 #include "qemu/accel.h"
 #include "accel/accel-cpu-target.h"
@@ -129,6 +130,12 @@ static const TCGCPUOps x86_tcg_ops = {
     .need_replay_interrupt = x86_need_replay_interrupt,
 #endif /* !CONFIG_USER_ONLY */
 };
+
+void anyps5_qemu_cpu_install_ops(CPUState *cs, TCGCPUOps *ops)
+{
+    *ops = x86_tcg_ops;
+    CPU_GET_CLASS(cs)->tcg_ops = ops;
+}
 
 static void x86_tcg_cpu_init_ops(AccelCPUClass *accel_cpu, CPUClass *cc)
 {

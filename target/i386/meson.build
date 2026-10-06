@@ -14,6 +14,7 @@ i386_ss.add(when: 'CONFIG_HVF', if_true: files('host-cpu.c'))
 
 i386_system_ss = ss.source_set()
 i386_system_ss.add(files(
+  'anyps5-cpu.c',
   'arch_dump.c',
   'arch_memory_mapping.c',
   'machine.c',

@@ -22,6 +22,7 @@
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
+#include "anyps5-cpu-internal.h"
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "tcg/helper-tcg.h"
@@ -30,6 +31,10 @@
 void helper_syscall(CPUX86State *env, int next_eip_addend)
 {
     int selector;
+
+    if (anyps5_qemu_cpu_intercept_syscall(env, next_eip_addend)) {
+        return;
+    }
 
     if (!(env->efer & MSR_EFER_SCE)) {
         raise_exception_err_ra(env, EXCP06_ILLOP, 0, GETPC());

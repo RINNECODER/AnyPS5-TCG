@@ -1238,7 +1238,8 @@ static void memory_region_do_init(MemoryRegion *mr,
         char *name_array = g_strdup_printf("%s[*]", escaped_name);
 
         if (!owner) {
-            owner = machine_get_container("unattached");
+            owner = current_machine ? machine_get_container("unattached") :
+                                      object_get_root();
         }
 
         object_property_add_child(owner, name_array, OBJECT(mr));
