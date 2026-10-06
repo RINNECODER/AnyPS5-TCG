@@ -6,6 +6,8 @@
   anyps5_qemu_cpu_release_backing;
   anyps5_qemu_cpu_map_alias;
   anyps5_qemu_cpu_unmap;
+  anyps5_qemu_cpu_unmap_range;
+  anyps5_qemu_cpu_replace_alias;
   anyps5_qemu_cpu_protect;
   anyps5_qemu_cpu_protect_range;
   anyps5_qemu_cpu_invalidate;

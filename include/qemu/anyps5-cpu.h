@@ -57,6 +57,15 @@ int anyps5_qemu_cpu_map_alias(AnyPS5QemuCpu *cpu, uint64_t address,
                             uint64_t backing_id, size_t offset, size_t size,
                             unsigned permissions);
 int anyps5_qemu_cpu_unmap(AnyPS5QemuCpu *cpu, uint64_t address);
+/* Atomically remove covered logical pages, retaining both outside fragments. */
+int anyps5_qemu_cpu_unmap_range(AnyPS5QemuCpu *cpu, uint64_t address, size_t size);
+/* Replace fully covered pages (including PROT_NONE) with one backing alias.
+ * Rejected ranges, holes, backing extents or capacity leave all mappings intact.
+ * Backing registration/lifetime follows map_alias; unrelated gates are retained.
+ */
+int anyps5_qemu_cpu_replace_alias(AnyPS5QemuCpu *cpu, uint64_t address,
+                                uint64_t backing_id, size_t offset, size_t size,
+                                unsigned permissions);
 int anyps5_qemu_cpu_protect(AnyPS5QemuCpu *cpu, uint64_t address,
                           unsigned permissions);
 int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
