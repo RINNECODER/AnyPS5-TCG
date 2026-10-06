@@ -123,16 +123,68 @@ static unsigned range_permissions(AnyPS5QemuRange *range, uint64_t address,
                                   size_t size)
 {
     size_t offset = address - range->address;
+    size_t end = offset + size;
+    size_t cursor = offset;
     unsigned permissions = 7;
 
     for (size_t i = 0; i < range->protections->len; i++) {
         AnyPS5QemuProtection *p = &g_array_index(range->protections,
                                                AnyPS5QemuProtection, i);
-        if (offset < p->offset + p->size && p->offset < offset + size) {
+        if (offset < p->offset + p->size && p->offset < end) {
+            if (p->offset > cursor) {
+                return 0;
+            }
             permissions &= p->permissions;
+            cursor = MIN(end, p->offset + p->size);
+            if (cursor == end) {
+                return permissions;
+            }
         }
     }
-    return permissions;
+    return 0;
+}
+
+static uint64_t range_access_fault(AnyPS5QemuRange *range, uint64_t address,
+                                  size_t size, unsigned permission)
+{
+    size_t cursor = address - range->address;
+    size_t end = cursor + size;
+
+    for (size_t i = 0; i < range->protections->len; i++) {
+        AnyPS5QemuProtection *p = &g_array_index(range->protections,
+                                               AnyPS5QemuProtection, i);
+        if (p->offset + p->size <= cursor) {
+            continue;
+        }
+        if (p->offset > cursor || !(p->permissions & permission)) {
+            return range->address + cursor;
+        }
+        cursor = MIN(end, p->offset + p->size);
+        if (cursor == end) {
+            break;
+        }
+    }
+    return range->address + cursor;
+}
+
+static bool range_page_subdivided(AnyPS5QemuRange *range, uint64_t address)
+{
+    size_t first = (address & TARGET_PAGE_MASK) - range->address;
+    size_t last = first + TARGET_PAGE_SIZE;
+    unsigned permissions = 8;
+
+    for (size_t i = 0; i < range->protections->len; i++) {
+        AnyPS5QemuProtection *p = &g_array_index(range->protections,
+                                               AnyPS5QemuProtection, i);
+        if (p->offset >= last || first >= p->offset + p->size) {
+            continue;
+        }
+        if (permissions != 8 && permissions != p->permissions) {
+            return true;
+        }
+        permissions = p->permissions;
+    }
+    return false;
 }
 
 static AnyPS5QemuBacking *find_backing(AnyPS5QemuCpu *cpu, uint64_t id)
@@ -299,7 +351,10 @@ static bool bridge_tlb_fill(CPUState *cs, vaddr address, int size,
         if (probe) {
             return false;
         }
-        save_stop(cpu, ANYPS5_QEMU_FAULT, address, EXCP0E_PAGE,
+        save_stop(cpu, ANYPS5_QEMU_FAULT,
+                  range ? range_access_fault(range, address,
+                                             size > 0 ? size : 1, permission) :
+                          address, EXCP0E_PAGE,
                   (range ? PG_ERROR_P_MASK : 0) | PG_ERROR_U_MASK |
                   (access_type == MMU_DATA_STORE ? PG_ERROR_W_MASK : 0) |
                   (access_type == MMU_INST_FETCH ? PG_ERROR_I_D_MASK : 0));
@@ -307,7 +362,8 @@ static bool bridge_tlb_fill(CPUState *cs, vaddr address, int size,
         cpu_loop_exit_restore(cs, retaddr);
     }
     tlb_set_page(cs, address & TARGET_PAGE_MASK, address & TARGET_PAGE_MASK,
-                 permissions, mmu_idx, TARGET_PAGE_SIZE);
+                 permissions, mmu_idx,
+                 range_page_subdivided(range, address) ? 1 : TARGET_PAGE_SIZE);
     return true;
 }
 
@@ -834,6 +890,72 @@ int anyps5_qemu_cpu_replace_alias(AnyPS5QemuCpu *cpu, uint64_t address,
 {
     return change_guest_range(cpu, address, size, true, backing_id, offset,
                               permissions);
+}
+
+int anyps5_qemu_cpu_protect_fragment(AnyPS5QemuCpu *cpu, uint64_t address,
+                                   size_t size, unsigned permissions)
+{
+    AnyPS5QemuRange *range;
+    GArray *updated;
+    size_t page_first, page_last, first, last, cursor;
+    uint64_t page;
+
+    if (!on_owner(cpu)) {
+        return fail(NULL, "Data fragment protection requires its CPU owner");
+    }
+    if (cpu->running || !size || address >= 0x800000000000ULL ||
+        size > 0x800000000000ULL - address ||
+        size > TARGET_PAGE_SIZE - (address & ~TARGET_PAGE_MASK) ||
+        (permissions & ~(ANYPS5_QEMU_READ | ANYPS5_QEMU_WRITE))) {
+        return fail(cpu, "Data fragment protection requires one mapped page and data permissions");
+    }
+    page = address & TARGET_PAGE_MASK;
+    range = find_range(cpu, page, TARGET_PAGE_SIZE);
+    if (!range) {
+        return fail(cpu, "Data fragment protection requires a complete mapped page");
+    }
+    page_first = page - range->address;
+    page_last = page_first + TARGET_PAGE_SIZE;
+    cursor = page_first;
+    /* Preflight the whole page, including gaps and executable neighbors. */
+    for (size_t i = 0; i < range->protections->len; i++) {
+        AnyPS5QemuProtection *p = &g_array_index(range->protections,
+                                               AnyPS5QemuProtection, i);
+        if (p->offset >= page_last || page_first >= p->offset + p->size) {
+            continue;
+        }
+        if (p->offset > cursor || (p->permissions & ANYPS5_QEMU_EXECUTE)) {
+            return fail(cpu, "Data fragment page contains a gap or executable bytes");
+        }
+        cursor = MIN(page_last, p->offset + p->size);
+    }
+    if (cursor != page_last) {
+        return fail(cpu, "Data fragment page has incomplete protection coverage");
+    }
+    first = address - range->address;
+    last = first + size;
+    updated = g_array_new(false, false, sizeof(AnyPS5QemuProtection));
+    for (size_t i = 0; i < range->protections->len; i++) {
+        AnyPS5QemuProtection p = g_array_index(range->protections,
+                                              AnyPS5QemuProtection, i);
+        size_t p_end = p.offset + p.size;
+        if (p.offset >= last || first >= p_end) {
+            append_protection(updated, p);
+            continue;
+        }
+        size_t overlap_first = MAX(first, p.offset);
+        size_t overlap_last = MIN(last, p_end);
+        append_protection(updated, (AnyPS5QemuProtection) {
+            p.offset, overlap_first - p.offset, p.permissions });
+        append_protection(updated, (AnyPS5QemuProtection) {
+            overlap_first, overlap_last - overlap_first, permissions });
+        append_protection(updated, (AnyPS5QemuProtection) {
+            overlap_last, p_end - overlap_last, p.permissions });
+    }
+    GArray *old = range->protections;
+    range->protections = updated;
+    g_array_free(old, true);
+    return anyps5_qemu_cpu_invalidate(cpu);
 }
 
 int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,

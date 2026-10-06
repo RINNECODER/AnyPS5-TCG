@@ -70,6 +70,15 @@ int anyps5_qemu_cpu_protect(AnyPS5QemuCpu *cpu, uint64_t address,
                           unsigned permissions);
 int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
                                 size_t size, unsigned permissions);
+/* Change exact data permissions for a nonempty byte interval within one mapped
+ * 4-KiB page. Only NONE/READ/WRITE/READ|WRITE are accepted; any executable
+ * fragment already in that page rejects the change. Other bytes are retained.
+ * Guest accesses check every requested byte before each memory operation.
+ * Ordinary 256-bit stores preflight the full operand. Restartable masked,
+ * gather and REP operations retain their architectural incremental behavior.
+ */
+int anyps5_qemu_cpu_protect_fragment(AnyPS5QemuCpu *cpu, uint64_t address,
+                                   size_t size, unsigned permissions);
 /* Host writes bypass guest dirty tracking; call before executing changed code. */
 int anyps5_qemu_cpu_invalidate(AnyPS5QemuCpu *cpu);
 int anyps5_qemu_cpu_get(AnyPS5QemuCpu *cpu, enum AnyPS5QemuRegister reg,

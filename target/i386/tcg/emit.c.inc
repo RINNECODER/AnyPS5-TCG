@@ -63,6 +63,9 @@ typedef void (*SSEFunc_0_eppppii)(TCGv_ptr env, TCGv_ptr reg_a, TCGv_ptr reg_b,
 
 static void gen_JMP_m(DisasContext *s, X86DecodedInsn *decode);
 static void gen_JMP(DisasContext *s, X86DecodedInsn *decode);
+static void gen_VMASKMOVPS(DisasContext *s, X86DecodedInsn *decode);
+static void gen_VMASKMOVPD(DisasContext *s, X86DecodedInsn *decode);
+static void gen_VPMASKMOV(DisasContext *s, X86DecodedInsn *decode);
 
 static inline TCGv_i32 tcg_constant8u_i32(uint8_t val)
 {
@@ -315,6 +318,24 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
         compute_xmm_offset(op);
     load_vector:
         if (op->has_ea) {
+            if (opn == 2 &&
+                (decode->e.gen == gen_VMASKMOVPS ||
+                 decode->e.gen == gen_VMASKMOVPD ||
+                 decode->e.gen == gen_VPMASKMOV)) {
+                bool quad = decode->e.gen == gen_VMASKMOVPD ||
+                            (decode->e.gen == gen_VPMASKMOV && s->vex_w);
+                TCGv_ptr destination = tcg_temp_new_ptr();
+                TCGv_ptr mask = tcg_temp_new_ptr();
+
+                tcg_gen_addi_ptr(destination, tcg_env, op->offset);
+                tcg_gen_addi_ptr(mask, tcg_env,
+                                 decode->op[1].offset -
+                                 xmm_offset(decode->op[1].ot));
+                gen_helper_masked_load(tcg_env, destination, mask, s->A0,
+                                      tcg_constant_i32(quad ? 8 : 4),
+                                      tcg_constant_i32(1u << op->ot));
+                break;
+            }
             bool aligned = sse_needs_alignment(s, decode, op->ot);
             gen_load_sse(s, v, op->ot, op->offset, aligned);
         }

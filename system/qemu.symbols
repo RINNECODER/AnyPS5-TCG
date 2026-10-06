@@ -10,6 +10,7 @@
   anyps5_qemu_cpu_replace_alias;
   anyps5_qemu_cpu_protect;
   anyps5_qemu_cpu_protect_range;
+  anyps5_qemu_cpu_protect_fragment;
   anyps5_qemu_cpu_invalidate;
   anyps5_qemu_cpu_get;
   anyps5_qemu_cpu_set;
