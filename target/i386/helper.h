@@ -15,6 +15,8 @@ DEF_HELPER_2(divq_EAX, void, env, tl)
 DEF_HELPER_2(idivq_EAX, void, env, tl)
 #endif
 DEF_HELPER_FLAGS_2(cr4_testbit, TCG_CALL_NO_WG, void, env, i32)
+DEF_HELPER_FLAGS_4(probe_store, TCG_CALL_NO_WG, void, env, tl, i32, i32)
+DEF_HELPER_6(masked_load, void, env, ptr, ptr, tl, i32, i32)
 
 DEF_HELPER_FLAGS_2(bndck, TCG_CALL_NO_WG, void, env, i32)
 DEF_HELPER_FLAGS_3(bndldx32, TCG_CALL_NO_WG, i64, env, tl, tl)

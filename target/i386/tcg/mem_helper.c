@@ -26,6 +26,48 @@
 #include "qemu/atomic128.h"
 #include "tcg/tcg.h"
 #include "helper-tcg.h"
+#include "access.h"
+
+void helper_probe_store(CPUX86State *env, target_ulong address, uint32_t size,
+                        uint32_t alignment)
+{
+    X86Access access;
+
+    if (alignment && (address & (alignment - 1))) {
+        handle_unaligned_access(env, address, MMU_DATA_STORE, GETPC());
+    }
+    /* Resolve both pages before a composite store writes its first part. */
+    access_prepare(&access, env, address, size, MMU_DATA_STORE, GETPC());
+}
+
+void helper_masked_load(CPUX86State *env, void *destination, void *mask_pointer,
+                        target_ulong address, uint32_t element_size,
+                        uint32_t vector_size)
+{
+    const ZMMReg *mask = mask_pointer;
+    ZMMReg result = {0};
+    uintptr_t ra = GETPC();
+
+    assert((element_size == 4 || element_size == 8) &&
+           (vector_size == 16 || vector_size == 32));
+    /* Inactive lanes never access memory. Stage all selected reads before
+     * destination writes, including when the destination aliases its mask.
+     */
+    for (unsigned i = 0; i < vector_size / element_size; i++) {
+        if (element_size == 4) {
+            if (mask->ZMM_L(i) >> 31) {
+                result.ZMM_L(i) = cpu_ldl_data_ra(env, address + i * 4, ra);
+            }
+        } else if (mask->ZMM_Q(i) >> 63) {
+            result.ZMM_Q(i) = cpu_ldq_data_ra(env, address + i * 8, ra);
+        }
+    }
+    if (vector_size == 16) {
+        memcpy(destination, &result.ZMM_X(0), 16);
+    } else {
+        memcpy(destination, &result.ZMM_Y(0), 32);
+    }
+}
 
 void helper_boundw(CPUX86State *env, target_ulong a0, int v)
 {

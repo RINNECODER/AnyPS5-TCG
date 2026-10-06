@@ -2407,6 +2407,8 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
 
+    gen_helper_probe_store(tcg_env, s->A0, tcg_constant_i32(32),
+                           tcg_constant_i32(align ? 32 : 0));
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(s->tmp0, s->A0, 16);
