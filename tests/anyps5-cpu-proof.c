@@ -44,6 +44,144 @@ static AnyPS5QemuRunResult run(AnyPS5QemuCpu *cpu, uint64_t budget)
     return result;
 }
 
+static void run_to(AnyPS5QemuCpu *cpu, uint64_t start, uint64_t until)
+{
+    AnyPS5QemuRunResult result;
+    set_reg(cpu, ANYPS5_QEMU_RIP, start);
+    check_api(cpu, anyps5_qemu_cpu_run_until(cpu, 1, until, &result), "run until");
+    require(result.reason == ANYPS5_QEMU_STOP_ADDRESS &&
+            result.instructions == 1 && result.rip == until,
+            "one actual instruction reaches exact stop address");
+}
+
+static void verify_aliases(uint8_t *code, uint8_t *data, size_t size)
+{
+    char error[256] = {0};
+    AnyPS5QemuCpu *cpu = anyps5_qemu_cpu_create(error, sizeof(error));
+    uint64_t code_id, data_id, rejected_id, observed;
+    AnyPS5QemuRunResult result;
+    const uint8_t store[] = {0x48,0x89,0x07};
+    const uint8_t load[] = {0x48,0x8b,0x07};
+    const uint8_t immediate[] = {0xb8,1,0,0,0};
+    const uint8_t sysenter[] = {0x0f,0x34};
+    const uint8_t wrmsr[] = {0x0f,0x30};
+    const uint8_t fs_load[] = {0x64,0x48,0x8b,0x07};
+
+    require(cpu != NULL, "create alias proof CPU");
+    memcpy(code+0x900, store, sizeof(store));
+    memcpy(code+0x910, load, sizeof(load));
+    memcpy(code+0x920, immediate, sizeof(immediate));
+    memcpy(code+0x940, sysenter, sizeof(sysenter));
+    memcpy(code+0x950, wrmsr, sizeof(wrmsr));
+    memcpy(code+0x970, fs_load, sizeof(fs_load));
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, code, size, &code_id), "register code backing");
+    check_api(cpu, anyps5_qemu_cpu_register_backing(cpu, data, size, &data_id), "register data backing");
+    require(anyps5_qemu_cpu_register_backing(cpu, code, size, &rejected_id) != 0,
+            "overlapping physical host backing registration fails");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x300000, code_id, 0, 4096, 5), "map 4KiB code alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x310000, code_id, 0, 4096, 5), "map second code alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x400000, data_id, 0, 4096, 3), "map first shared data alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x410000, data_id, 0, 4096, 3), "map second shared data alias");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x420000, data_id, 4096, 4096, 1), "map 4KiB-offset read-only data");
+    check_api(cpu, anyps5_qemu_cpu_map_alias(cpu, 0x430000, data_id, 8192, 8192, 3), "map data spanning two guest pages");
+    require(anyps5_qemu_cpu_release_backing(cpu, data_id) != 0,
+            "live aliases keep registered backing alive");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x400008);
+    set_reg(cpu, ANYPS5_QEMU_RAX, 0x12345678abcdef01ULL);
+    run_to(cpu, 0x300900, 0x300903);
+    memcpy(&observed, data+8, 8);
+    require(observed == 0x12345678abcdef01ULL, "guest alias writes exact shared host backing bytes");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x410008);
+    run_to(cpu, 0x300910, 0x300913);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 0x12345678abcdef01ULL,
+            "second guest alias sees actual first-alias store");
+    set_reg(cpu, ANYPS5_QEMU_FS_BASE, 0x410000);
+    set_reg(cpu, ANYPS5_QEMU_RDI, 8);
+    run_to(cpu, 0x300970, 0x300974);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 0x12345678abcdef01ULL,
+            "actual FS-relative guest load uses translated TLS base");
+    observed = 0x0fedcba987654321ULL;
+    memcpy(data+4096+16, &observed, 8);
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x420010);
+    run_to(cpu, 0x300910, 0x300913);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 0x0fedcba987654321ULL,
+            "4KiB-offset alias resolves correct physical host offset");
+    check_api(cpu, anyps5_qemu_cpu_protect_range(cpu, 0x400000, 4096, 1), "protect one shared alias");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x400008);
+    set_reg(cpu, ANYPS5_QEMU_RAX, 99);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x300900);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.vector == 14 &&
+            result.address == 0x400008 && result.instructions == 0,
+            "read-only alias fails explicitly on guest write");
+    memcpy(&observed, data+8, 8);
+    require(observed == 0x12345678abcdef01ULL, "denied alias write preserves physical backing");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x410008);
+    run_to(cpu, 0x300900, 0x300903);
+    memcpy(&observed, data+8, 8);
+    require(observed == 99, "shared alias has independent guest permissions");
+    check_api(cpu, anyps5_qemu_cpu_protect_range(cpu, 0x431000, 4096, 1), "protect half of a guest span");
+    require(anyps5_qemu_cpu_protect_range(cpu, 0x430000, 12288, 1) != 0,
+            "protection of a span containing a hole fails atomically");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x430010);
+    set_reg(cpu, ANYPS5_QEMU_RAX, 0x1122334455667788ULL);
+    run_to(cpu, 0x300900, 0x300903);
+    memcpy(&observed, data+8192+16, 8);
+    require(observed == 0x1122334455667788ULL,
+            "writable neighbor remains writable after partial and rejected protection");
+    observed = 0xaabbccddeeff0011ULL;
+    memcpy(data+12288+16, &observed, 8);
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x431010);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x300900);
+    result = run(cpu, 1);
+    memcpy(&observed, data+12288+16, 8);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.address == 0x431010 &&
+            observed == 0xaabbccddeeff0011ULL,
+            "read-only 4KiB page within the same host page preserves backing");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x421000);
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x300910);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_FAULT && result.address == 0x421000,
+            "registered physical backing padding is not guest-accessible");
+    run_to(cpu, 0x300920, 0x300925);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 1, "first code alias reads original immediate");
+    run_to(cpu, 0x310920, 0x310925);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 1, "second code alias reads original immediate");
+    code[0x921] = 7;
+    check_api(cpu, anyps5_qemu_cpu_invalidate(cpu), "invalidate host-modified shared code");
+    run_to(cpu, 0x300920, 0x300925);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 7, "first code alias executes changed host source bytes");
+    run_to(cpu, 0x310920, 0x310925);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 7, "second code alias also discards stale translated code");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x300940);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 13,
+            "SYSENTER has no fabricated service transition");
+    set_reg(cpu, ANYPS5_QEMU_RIP, 0x300950);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_UNSUPPORTED && result.vector == 13,
+            "guest privileged MSR access fails explicitly");
+    anyps5_qemu_cpu_stop(cpu);
+    result = run(cpu, 1);
+    require(result.reason == ANYPS5_QEMU_REQUESTED_STOP && result.instructions == 0,
+            "stop still prevents guest execution until cleared");
+    check_api(cpu, anyps5_qemu_cpu_clear_stop(cpu), "clear previous run stop");
+    run_to(cpu, 0x300920, 0x300925);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 7, "cleared CPU resumes actual guest instructions");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x400000), "unmap first data alias");
+    set_reg(cpu, ANYPS5_QEMU_RDI, 0x410008);
+    run_to(cpu, 0x300910, 0x300913);
+    require(get_reg(cpu, ANYPS5_QEMU_RAX) == 99, "remaining alias survives peer unmapping");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x410000), "unmap second data alias");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x420000), "unmap offset data alias");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x430000), "unmap protected data span");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, data_id), "release unaliased data backing");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x300000), "unmap first code alias");
+    check_api(cpu, anyps5_qemu_cpu_unmap(cpu, 0x310000), "unmap second code alias");
+    check_api(cpu, anyps5_qemu_cpu_release_backing(cpu, code_id), "release unaliased code backing");
+    check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy alias proof CPU");
+}
+
 int main(void)
 {
     char error[256] = {0};
@@ -337,8 +475,9 @@ int main(void)
                 "recreated CPU preserves independent AVX results");
         check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy recreated CPU");
     }
+    verify_aliases(code, data, region_size);
     free(code);
     free(data);
-    puts("PASS: native ARM64 TCG AVX256/AVX128/AVX2/F16C/FMA, CPUID/XGETBV/XSAVE/XRSTOR, YMM, host call, syscall, budget, explicit faults and repeated create/destroy");
+    puts("PASS: native ARM64 TCG vectors/state, shared 4KiB aliases, partial protection, code coherence, TLS, stop/until, services and repeated lifecycle");
     return 0;
 }
