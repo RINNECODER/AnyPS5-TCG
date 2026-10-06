@@ -198,6 +198,17 @@ AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
     env = &cpu->x86->env;
     active_cpu = cpu;
     anyps5_qemu_cpu_install_ops(cs, &bridge_ops);
+    if (!anyps5_qemu_cpu_prepare_model(cpu->x86, &local_error)) {
+        if (error && error_size) {
+            pstrcpy(error, error_size, error_get_pretty(local_error));
+        }
+        error_free(local_error);
+        object_unref(OBJECT(cpu->x86));
+        active_cpu = NULL;
+        g_free(cpu);
+        bql_unlock();
+        return NULL;
+    }
     bridge_ops.tlb_fill = bridge_tlb_fill;
     bridge_ops.do_interrupt = bridge_interrupt;
     bridge_ops.debug_excp_handler = NULL;

@@ -131,8 +131,11 @@ static const TCGCPUOps x86_tcg_ops = {
 #endif /* !CONFIG_USER_ONLY */
 };
 
+static void x86_tcg_cpu_xsave_init(void);
+
 void anyps5_qemu_cpu_install_ops(CPUState *cs, TCGCPUOps *ops)
 {
+    x86_tcg_cpu_xsave_init();
     *ops = x86_tcg_ops;
     CPU_GET_CLASS(cs)->tcg_ops = ops;
 }
