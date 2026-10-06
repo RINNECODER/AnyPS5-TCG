@@ -45,6 +45,7 @@
 
 #include "disas/capstone.h"
 #include "cpu-internal.h"
+#include "anyps5-cpu-internal.h"
 
 static void x86_cpu_realizefn(DeviceState *dev, Error **errp);
 static void x86_cpu_get_supported_cpuid(uint32_t func, uint32_t index,
@@ -8037,6 +8038,50 @@ static bool x86_cpu_filter_features(X86CPU *cpu, bool verbose)
 
     return have_filtered_features;
 }
+
+#ifndef CONFIG_USER_ONLY
+bool anyps5_qemu_cpu_prepare_model(X86CPU *cpu, Error **errp)
+{
+    CPUX86State *env = &cpu->env;
+    X86CPUClass *xcc = X86_CPU_GET_CLASS(cpu);
+    Error *local_error = NULL;
+
+    x86_cpu_expand_features(cpu, &local_error);
+    if (local_error) {
+        error_propagate(errp, local_error);
+        return false;
+    }
+    x86_cpu_filter_features(cpu, false);
+    x86_cpu_enable_xsave_components(cpu);
+
+    /* CPUID cache leaves require the same data as regular CPU realization. */
+    if (!cpu->legacy_cache) {
+        const CPUCaches *cache_info = xcc->model ?
+            x86_cpu_get_versioned_cache_info(cpu, xcc->model) : NULL;
+
+        if (!cache_info) {
+            error_setg(errp, "CPU model lacks required CPUID cache information");
+            return false;
+        }
+        env->cache_info_cpuid2 = env->cache_info_cpuid4 =
+            env->cache_info_amd = *cache_info;
+    } else {
+        env->cache_info_cpuid2 = (CPUCaches) {
+            &legacy_l1d_cache, &legacy_l1i_cache,
+            &legacy_l2_cache_cpuid2, &legacy_l3_cache
+        };
+        env->cache_info_cpuid4 = (CPUCaches) {
+            &legacy_l1d_cache, &legacy_l1i_cache,
+            &legacy_l2_cache, &legacy_l3_cache
+        };
+        env->cache_info_amd = (CPUCaches) {
+            &legacy_l1d_cache_amd, &legacy_l1i_cache_amd,
+            &legacy_l2_cache_amd, &legacy_l3_cache
+        };
+    }
+    return true;
+}
+#endif
 
 static void x86_cpu_hyperv_realize(X86CPU *cpu)
 {
