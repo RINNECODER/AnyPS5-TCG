@@ -9,6 +9,8 @@
 #include "qemu/atomic.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
+#include "qemu/host-utils.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "anyps5-cpu-internal.h"
@@ -23,6 +25,7 @@
 #include "accel/tcg/tcg-accel-ops.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
+#include "system/accel-ops.h"
 #include "system/cpus.h"
 #include "system/tcg.h"
 #include "gdbstub/enums.h"
@@ -639,6 +642,48 @@ bool anyps5_qemu_cpu_intercept_syscall(CPUX86State *env, int next_eip_addend)
     cpu_loop_exit(cs);
 }
 
+/*
+ * The bridge runs without a QEMU machine or accelerator, so nothing registers
+ * an AccelOpsClass and cpus_accel stays NULL. Guest RDTSC/RDTSCP reach
+ * cpu_get_tsc() -> cpus_get_elapsed_ticks(), which dereferences it. These ops
+ * give that path the guest TSC; every other cpus_accel hook is left NULL so
+ * cpus.c uses its generic fallback.
+ */
+static uint64_t last_tsc;
+
+uint64_t anyps5_qemu_cpu_read_tsc(void)
+{
+    uint64_t now = muldiv64(get_clock(), ANYPS5_QEMU_TSC_FREQUENCY,
+                            NANOSECONDS_PER_SECOND);
+    uint64_t last = qatomic_read(&last_tsc);
+
+    for (;;) {
+        uint64_t next = now > last ? now : last + 1;
+        uint64_t seen = qatomic_cmpxchg(&last_tsc, last, next);
+
+        if (seen == last) {
+            return next;
+        }
+        last = seen;
+    }
+}
+
+static int64_t bridge_elapsed_ticks(void)
+{
+    return anyps5_qemu_cpu_read_tsc();
+}
+
+static void bridge_create_vcpu_thread(CPUState *cs)
+{
+    /* The bridge runs its CPU on the caller's thread; qemu_init_vcpu is unused. */
+    g_assert_not_reached();
+}
+
+static AccelOpsClass bridge_accel_ops = {
+    .create_vcpu_thread = bridge_create_vcpu_thread,
+    .get_elapsed_ticks = bridge_elapsed_ticks,
+};
+
 static void initialize_core(void)
 {
     module_call_init(MODULE_INIT_TRACE);
@@ -653,6 +698,7 @@ static void initialize_core(void)
     tb_htable_init();
     tcg_init(32 * MiB, 0, 1);
     tcg_prologue_init();
+    cpus_register_accel(&bridge_accel_ops);
     bql_unlock();
 }
 

@@ -26,6 +26,7 @@
   anyps5_qemu_cpu_stop;
   anyps5_qemu_cpu_clear_stop;
   anyps5_qemu_cpu_error;
+  anyps5_qemu_cpu_read_tsc;
   qemu_init;
   qemu_main_loop;
   qemu_cleanup;

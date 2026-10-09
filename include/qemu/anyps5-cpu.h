@@ -111,6 +111,17 @@ void anyps5_qemu_cpu_stop(AnyPS5QemuCpu *cpu);
 int anyps5_qemu_cpu_clear_stop(AnyPS5QemuCpu *cpu);
 const char *anyps5_qemu_cpu_error(AnyPS5QemuCpu *cpu);
 
+/* Nominal PS5 time stamp counter frequency in Hz. Guest RDTSC/RDTSCP and any
+ * HLE sceKernelReadTsc/sceKernelGetTscFrequency must use this and
+ * anyps5_qemu_cpu_read_tsc() so guest-visible time stays on one clock.
+ */
+#define ANYPS5_QEMU_TSC_FREQUENCY 1600000000ULL
+/* The guest TSC: the host monotonic clock scaled to ANYPS5_QEMU_TSC_FREQUENCY,
+ * strictly increasing across all reads on all threads. It needs no CPU.
+ * RDTSCP reports TSC_AUX (ECX) as 0.
+ */
+uint64_t anyps5_qemu_cpu_read_tsc(void);
+
 #ifdef __cplusplus
 }
 #endif
