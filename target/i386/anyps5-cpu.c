@@ -3,6 +3,7 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/thread.h"
+#include "qemu/queue.h"
 #include "qemu/units.h"
 #include "qemu/rcu.h"
 #include "qemu/atomic.h"
@@ -55,6 +56,7 @@ typedef struct AnyPS5QemuUserState {
 struct AnyPS5QemuContext {
     AnyPS5QemuUserState *state;
     AnyPS5QemuContext *next;
+    QLIST_ENTRY(AnyPS5QemuContext) live;
 };
 
 typedef struct AnyPS5QemuBacking {
@@ -99,7 +101,11 @@ struct AnyPS5QemuCpu {
     bool pending;
     bool running;
     bool requested_stop;
+    /*
+     * Retain handles for ABA safety; search only live contexts.
+     */
     AnyPS5QemuContext *contexts;
+    QLIST_HEAD(, AnyPS5QemuContext) live_contexts;
     SegmentCache context_cs, context_ss;
     uint32_t context_profile_hflags;
     char error[256];
@@ -162,9 +168,12 @@ static int context_idle(AnyPS5QemuCpu *cpu)
 static AnyPS5QemuContext *find_context(AnyPS5QemuCpu *cpu,
                                      const AnyPS5QemuContext *context)
 {
-    for (AnyPS5QemuContext *entry = cpu->contexts; entry; entry = entry->next) {
+    AnyPS5QemuContext *entry;
+
+    /* Compare membership before dereferencing any caller-supplied pointer. */
+    QLIST_FOREACH(entry, &cpu->live_contexts, live) {
         if (entry == context) {
-            return entry->state ? entry : NULL;
+            return entry;
         }
     }
     return NULL;
@@ -223,6 +232,7 @@ int anyps5_qemu_cpu_context_create(AnyPS5QemuCpu *cpu,
     capture_context(cpu, entry->state);
     entry->next = cpu->contexts;
     cpu->contexts = entry;
+    QLIST_INSERT_HEAD(&cpu->live_contexts, entry, live);
     *context = entry;
     return 0;
 }
@@ -319,6 +329,7 @@ int anyps5_qemu_cpu_context_destroy(AnyPS5QemuCpu *cpu,
     if (!entry) {
         return fail(cpu, "Context destruction requires a live CPU-owned context");
     }
+    QLIST_REMOVE(entry, live);
     g_free(entry->state);
     entry->state = NULL;
     /* Keep the small handle until CPU destruction, preventing address reuse
