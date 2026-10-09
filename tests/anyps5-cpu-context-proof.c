@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 static void require(bool condition, const char *message)
@@ -84,7 +85,7 @@ static void reject_context(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *context,
     }
 }
 
-static void preflight(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *live)
+static void preflight(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *live, size_t page)
 {
     pthread_t other;
     max_align_t foreign_storage;
@@ -97,6 +98,14 @@ static void preflight(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *live)
     reject_context(cpu, NULL, "null handle");
     reject_context(cpu, (AnyPS5QemuContext *)&foreign_storage,
                    "foreign unowned storage");
+    /* Readable foreign storage cannot expose a pre-membership dereference. */
+    void *inaccessible = mmap(NULL, page, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+    require(inaccessible != MAP_FAILED,
+            "allocate inaccessible foreign context");
+    reject_context(cpu, inaccessible, "inaccessible unregistered storage");
+    require(munmap(inaccessible, page) == 0,
+            "release inaccessible foreign context");
     require(anyps5_qemu_cpu_context_create(NULL, &rejected_output) != 0 &&
             rejected_output == live,
             "null CPU creation preflight leaves output unchanged");
@@ -124,6 +133,74 @@ static void preflight(AnyPS5QemuCpu *cpu, AnyPS5QemuContext *live)
     }
     require(access.created == live,
             "non-owner context creation leaves caller output unchanged");
+}
+
+/* Exercise membership through the public API, independently of its index. */
+static void mixed_lifetimes(AnyPS5QemuCpu *cpu)
+{
+    AnyPS5QemuContext *contexts[4], *retired[256], *fresh;
+    const unsigned order[] = {1, 3, 0, 2};
+    uint64_t expected[] = {11, 22, 33, 44};
+    bool alive[] = {true, true, true, true};
+
+    for (unsigned i = 0; i < 4; i++) {
+        set_reg(cpu, ANYPS5_QEMU_RAX, expected[i]);
+        check_api(cpu, anyps5_qemu_cpu_context_create(cpu, &contexts[i]),
+                  "capture independently valued lifetime context");
+    }
+    for (unsigned step = 0; step < 4; step++) {
+        const unsigned removed = order[step];
+        check_api(cpu, anyps5_qemu_cpu_context_destroy(cpu, contexts[removed]),
+                  "retire context in mixed creation order");
+        alive[removed] = false;
+        for (unsigned i = 0; i < 4; i++) {
+            if (!alive[i]) {
+                reject_context(cpu, contexts[i], "mixed-order retired context");
+                continue;
+            }
+            uint64_t observed = 0;
+            check_api(cpu, anyps5_qemu_cpu_context_restore(cpu, contexts[i]),
+                      "restore survivor of unrelated retirement");
+            check_api(cpu, anyps5_qemu_cpu_get(cpu, ANYPS5_QEMU_RAX, &observed),
+                      "read surviving snapshot value");
+            require(observed == expected[i],
+                    "retiring another context changed a surviving snapshot");
+            expected[i] += 100;
+            set_reg(cpu, ANYPS5_QEMU_RAX, expected[i]);
+            check_api(cpu, anyps5_qemu_cpu_context_save(cpu, contexts[i]),
+                      "save survivor after unrelated retirement");
+        }
+    }
+    for (unsigned i = 0; i < 256; i++) {
+        check_api(cpu, anyps5_qemu_cpu_context_create(cpu, &retired[i]),
+                  "create after all previous contexts retired");
+        for (unsigned j = 0; j < 4; j++) {
+            require(retired[i] != contexts[j],
+                    "mixed-order retired address reused");
+        }
+        for (unsigned j = 0; j < i; j++) {
+            require(retired[i] != retired[j],
+                    "retired address reused during churn");
+        }
+        check_api(cpu, anyps5_qemu_cpu_context_destroy(cpu, retired[i]),
+                  "retire churn context");
+    }
+    set_reg(cpu, ANYPS5_QEMU_RAX, 0x12345678);
+    check_api(cpu, anyps5_qemu_cpu_context_create(cpu, &fresh),
+              "capture fresh context after retirement churn");
+    for (unsigned i = 0; i < 256; i++) {
+        require(fresh != retired[i], "fresh context reused a retired address");
+        reject_context(cpu, retired[i],
+                       "retired handle after allocation churn");
+    }
+    set_reg(cpu, ANYPS5_QEMU_RAX, 0);
+    check_api(cpu, anyps5_qemu_cpu_context_restore(cpu, fresh),
+              "restore fresh snapshot after rejected retired calls");
+    uint64_t observed = 0;
+    check_api(cpu, anyps5_qemu_cpu_get(cpu, ANYPS5_QEMU_RAX, &observed),
+              "read fresh snapshot after rejected retired calls");
+    require(observed == 0x12345678, "retired calls damaged the fresh snapshot");
+    /* CPU destruction must own both this live state and all retired handles. */
 }
 
 static void reach(AnyPS5QemuCpu *cpu, uint64_t until)
@@ -282,7 +359,7 @@ int main(int argc, char **argv)
     prepare(cpu, data, 1, registers[1]);
     check_api(cpu, anyps5_qemu_cpu_context_save(cpu, contexts[1]),
               "replace second context with independently prepared state");
-    preflight(cpu, contexts[1]);
+    preflight(cpu, contexts[1], (size_t)host_page);
     reach(cpu, UINT64_C(0x100f10));
     observe(data, 1, registers[1]);
     for (unsigned pass = 0; pass < 4; pass++) {
@@ -307,6 +384,7 @@ int main(int argc, char **argv)
         check_api(cpu, anyps5_qemu_cpu_context_destroy(cpu, contexts[index]),
                   "retire context on idle owner");
     }
+    mixed_lifetimes(cpu);
     check_api(cpu, anyps5_qemu_cpu_destroy(cpu), "destroy owner CPU");
     free(data);
     free(code);
