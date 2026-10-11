@@ -94,8 +94,20 @@ int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
  */
 int anyps5_qemu_cpu_protect_fragment(AnyPS5QemuCpu *cpu, uint64_t address,
                                    size_t size, unsigned permissions);
-/* Host writes bypass guest dirty tracking; call before executing changed code. */
+/* Full fallback: drop every translation and TLB entry. Prefer invalidate_range. */
 int anyps5_qemu_cpu_invalidate(AnyPS5QemuCpu *cpu);
+/* Host writes bypass guest dirty tracking. After the host changes mapped guest
+ * bytes, drop only translations that overlap them. Bytes on pages that hold no
+ * translated code cost a bitmap check; aliases of the same backing are covered.
+ * Guest stores need no call: translated pages stay write-protected. */
+int anyps5_qemu_cpu_invalidate_range(AnyPS5QemuCpu *cpu, uint64_t address,
+                                   size_t size);
+typedef struct AnyPS5QemuCodeStats {
+    uint64_t full_flushes;       /* whole-cache flushes issued by this bridge */
+    uint64_t code_invalidations; /* precise invalidations that hit translated code */
+    uint64_t translations;       /* blocks translated, accumulated across flushes */
+} AnyPS5QemuCodeStats;
+int anyps5_qemu_cpu_code_stats(AnyPS5QemuCpu *cpu, AnyPS5QemuCodeStats *stats);
 int anyps5_qemu_cpu_get(AnyPS5QemuCpu *cpu, enum AnyPS5QemuRegister reg,
                        uint64_t *value);
 int anyps5_qemu_cpu_set(AnyPS5QemuCpu *cpu, enum AnyPS5QemuRegister reg,

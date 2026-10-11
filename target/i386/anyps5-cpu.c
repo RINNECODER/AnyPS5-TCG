@@ -19,6 +19,7 @@
 #include "exec/cpu-common.h"
 #include "exec/cputlb.h"
 #include "exec/exec-all.h"
+#include "exec/ram_addr.h"
 #include "exec/tb-flush.h"
 #include "exec/translation-block.h"
 #include "accel/tcg/cpu-ops.h"
@@ -112,6 +113,10 @@ struct AnyPS5QemuCpu {
     QLIST_HEAD(, AnyPS5QemuContext) live_contexts;
     SegmentCache context_cs, context_ss;
     uint32_t context_profile_hflags;
+    /* Code-cache diagnostics; owner thread only. */
+    uint64_t full_flushes;
+    uint64_t code_invalidations;
+    uint64_t flushed_translations;
     char error[256];
 };
 
@@ -828,6 +833,54 @@ AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
     return cpu;
 }
 
+/*
+ * Translations are keyed by RAM address, so every alias of a backing shares
+ * them. A page with translated code has its DIRTY_MEMORY_CODE bit clear.
+ */
+static void invalidate_ram_code(AnyPS5QemuCpu *cpu, ram_addr_t start,
+                                uint64_t size)
+{
+    if (!size || cpu_physical_memory_all_dirty(start, size, DIRTY_MEMORY_CODE)) {
+        return;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        tb_invalidate_phys_range(start, start + size - 1);
+    }
+    cpu->code_invalidations++;
+}
+
+static ram_addr_t range_ram_addr(AnyPS5QemuRange *range, uint64_t address)
+{
+    return memory_region_get_ram_addr(&range->backing->region) +
+           range->region.alias_offset + (address - range->address);
+}
+
+/*
+ * Permission changes keep the address space: drop only the affected TLB
+ * entries. tlb_flush_page also clears jump-cache entries for the page and its
+ * predecessor, and QEMU never chains directly into a page-spanning block.
+ */
+static void flush_guest_pages(AnyPS5QemuCpu *cpu, uint64_t address,
+                              uint64_t size)
+{
+    CPUState *cs = CPU(cpu->x86);
+    uint64_t first = address & TARGET_PAGE_MASK;
+    uint64_t last = (address + size - 1) & TARGET_PAGE_MASK;
+
+    bql_lock();
+    if ((last - first) >> TARGET_PAGE_BITS >= 64) {
+        tlb_flush(cs);
+    } else {
+        for (uint64_t page = first; ; page += TARGET_PAGE_SIZE) {
+            tlb_flush_page(cs, page);
+            if (page == last) {
+                break;
+            }
+        }
+    }
+    bql_unlock();
+}
+
 int anyps5_qemu_cpu_register_backing(AnyPS5QemuCpu *cpu, void *host,
                                    size_t allocated_size, uint64_t *id)
 {
@@ -879,6 +932,9 @@ int anyps5_qemu_cpu_release_backing(AnyPS5QemuCpu *cpu, uint64_t id)
             return fail(cpu, "Backing still has guest aliases");
         }
         bql_lock();
+        /* A later backing may reuse this RAM address range. */
+        invalidate_ram_code(cpu, memory_region_get_ram_addr(&backing->region),
+                            backing->size);
         object_unparent(OBJECT(&backing->region));
         memmove(cpu->backings + i, cpu->backings + i + 1,
                 (cpu->backing_count - i - 1) * sizeof(cpu->backings[0]));
@@ -936,8 +992,8 @@ int anyps5_qemu_cpu_map_alias(AnyPS5QemuCpu *cpu, uint64_t address,
     cpu->ranges[cpu->range_count++] = range;
     backing->aliases++;
     cs->halt_cond = halt_cond;
+    /* Translations are keyed by RAM address and stay valid for new aliases. */
     tlb_flush(cs);
-    tb_flush(cs);
     bql_unlock();
     return 0;
 }
@@ -977,8 +1033,8 @@ int anyps5_qemu_cpu_unmap(AnyPS5QemuCpu *cpu, uint64_t address)
         cs->halt_cond = NULL;
         memory_region_del_subregion(get_system_memory(), &range->region);
         cs->halt_cond = halt_cond;
+        /* Backing release drops its translations before the RAM can be reused. */
         tlb_flush(cs);
-        tb_flush(cs);
         object_unparent(OBJECT(&range->region));
         memmove(cpu->ranges + i, cpu->ranges + i + 1,
                 (cpu->range_count - i - 1) * sizeof(cpu->ranges[0]));
@@ -1009,15 +1065,68 @@ int anyps5_qemu_cpu_unmap(AnyPS5QemuCpu *cpu, uint64_t address)
     return fail(cpu, "Unmapping requires an existing range base");
 }
 
+static void flush_all_code(AnyPS5QemuCpu *cpu)
+{
+    CPUState *cs = CPU(cpu->x86);
+
+    cpu->flushed_translations += tcg_nb_tbs();
+    cpu->full_flushes++;
+    tlb_flush(cs);
+    tb_flush(cs);
+}
+
 int anyps5_qemu_cpu_invalidate(AnyPS5QemuCpu *cpu)
 {
     if (!on_owner(cpu) || cpu->running) {
         return fail(cpu, "Invalidation requires the idle owner thread");
     }
     bql_lock();
-    tlb_flush(CPU(cpu->x86));
-    tb_flush(CPU(cpu->x86));
+    flush_all_code(cpu);
     bql_unlock();
+    return 0;
+}
+
+int anyps5_qemu_cpu_invalidate_range(AnyPS5QemuCpu *cpu, uint64_t address,
+                                   size_t size)
+{
+    uint64_t end;
+
+    if (!on_owner(cpu) || cpu->running) {
+        return fail(cpu, "Invalidation requires the idle owner thread");
+    }
+    if (!size) {
+        return 0;
+    }
+    if (address >= 0x800000000000ULL || size > 0x800000000000ULL - address) {
+        return fail(cpu, "Invalid code invalidation range");
+    }
+    end = address + size;
+    for (uint64_t cursor = address; cursor < end; ) {
+        AnyPS5QemuRange *range = find_range(cpu, cursor, 1);
+        if (!range) {
+            return fail(cpu, "Code invalidation includes unmapped guest memory");
+        }
+        cursor = MIN(end, range->address + range->size);
+    }
+    bql_lock();
+    for (uint64_t cursor = address; cursor < end; ) {
+        AnyPS5QemuRange *range = find_range(cpu, cursor, 1);
+        uint64_t last = MIN(end, range->address + range->size);
+        invalidate_ram_code(cpu, range_ram_addr(range, cursor), last - cursor);
+        cursor = last;
+    }
+    bql_unlock();
+    return 0;
+}
+
+int anyps5_qemu_cpu_code_stats(AnyPS5QemuCpu *cpu, AnyPS5QemuCodeStats *stats)
+{
+    if (!on_owner(cpu) || !stats) {
+        return fail(cpu, "Code statistics require the owner thread");
+    }
+    stats->full_flushes = cpu->full_flushes;
+    stats->code_invalidations = cpu->code_invalidations;
+    stats->translations = cpu->flushed_translations + tcg_nb_tbs();
     return 0;
 }
 
@@ -1185,7 +1294,6 @@ static int change_guest_range(AnyPS5QemuCpu *cpu, uint64_t address, size_t size,
     cpu->gate_count = remaining_gates;
     cs->halt_cond = halt_cond;
     tlb_flush(cs);
-    tb_flush(cs);
     bql_unlock();
     /* Old FlatViews can refer to the embedded regions until RCU quiesces. */
     drain_call_rcu();
@@ -1281,7 +1389,8 @@ int anyps5_qemu_cpu_protect_fragment(AnyPS5QemuCpu *cpu, uint64_t address,
     GArray *old = range->protections;
     range->protections = updated;
     g_array_free(old, true);
-    return anyps5_qemu_cpu_invalidate(cpu);
+    flush_guest_pages(cpu, page, TARGET_PAGE_SIZE);
+    return 0;
 }
 
 int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
@@ -1331,7 +1440,8 @@ int anyps5_qemu_cpu_protect_range(AnyPS5QemuCpu *cpu, uint64_t address,
         g_array_free(range->protections, true);
         range->protections = updated;
     }
-    return anyps5_qemu_cpu_invalidate(cpu);
+    flush_guest_pages(cpu, address, size);
+    return 0;
 }
 
 int anyps5_qemu_cpu_protect(AnyPS5QemuCpu *cpu, uint64_t address,
