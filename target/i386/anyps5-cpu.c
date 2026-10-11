@@ -12,6 +12,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "crypto/random.h"
 #include "cpu.h"
 #include "anyps5-cpu-internal.h"
 #include "exec/address-spaces.h"
@@ -686,6 +687,8 @@ static AccelOpsClass bridge_accel_ops = {
 
 static void initialize_core(void)
 {
+    Error *random_error = NULL;
+
     module_call_init(MODULE_INIT_TRACE);
     qemu_init_cpu_list();
     qemu_init_cpu_loop();
@@ -699,8 +702,19 @@ static void initialize_core(void)
     tcg_init(32 * MiB, 0, 1);
     tcg_prologue_init();
     cpus_register_accel(&bridge_accel_ops);
+    /*
+     * RDRAND/RDSEED read the host entropy source through qcrypto; without this
+     * the source is never opened and every read fails with CF=0.
+     */
+    if (qcrypto_random_init(&random_error) < 0) {
+        error_report_err(random_error);
+    }
     bql_unlock();
 }
+
+static const char *const zen2_features[] = {
+    "adx", "rdseed", "sha-ni", "clflushopt", "clwb",
+};
 
 AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
 {
@@ -724,6 +738,24 @@ AnyPS5QemuCpu *anyps5_qemu_cpu_create(char *error, size_t error_size)
     qemu_thread_get_self(&cpu->owner);
     bql_lock();
     cpu->x86 = X86_CPU(object_new("Haswell-v4-x86_64-cpu"));
+    /*
+     * The PS5 CPU is Zen 2. Enable the Zen 2 extensions TCG implements on top
+     * of the Haswell base model; while a feature is off in the model its
+     * instructions raise #UD. XSAVEC stays off: TCG does not implement it.
+     */
+    for (size_t i = 0; i < ARRAY_SIZE(zen2_features); i++) {
+        if (!object_property_set_bool(OBJECT(cpu->x86), zen2_features[i], true,
+                                      &local_error)) {
+            if (error && error_size) {
+                pstrcpy(error, error_size, error_get_pretty(local_error));
+            }
+            error_free(local_error);
+            object_unref(OBJECT(cpu->x86));
+            g_free(cpu);
+            bql_unlock();
+            return NULL;
+        }
+    }
     cs = CPU(cpu->x86);
     env = &cpu->x86->env;
     active_cpu = cpu;
