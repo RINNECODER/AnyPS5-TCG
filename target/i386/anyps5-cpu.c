@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "accel/tcg/cpu-ops.h"
 #include "accel/tcg/internal-common.h"
+#include "accel/tcg/tb-context.h"
 #include "accel/tcg/tcg-accel-ops.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
@@ -704,7 +705,8 @@ static void initialize_core(void)
     mttcg_enabled = false;
     page_init();
     tb_htable_init();
-    tcg_init(32 * MiB, 0, 1);
+    /* Translations now persist across host calls; leave room for a large hot set. */
+    tcg_init(256 * MiB, 0, 1);
     tcg_prologue_init();
     cpus_register_accel(&bridge_accel_ops);
     /*
@@ -1550,6 +1552,7 @@ static int run_cpu(AnyPS5QemuCpu *cpu, uint64_t instruction_budget,
 {
     CPUState *cs;
     uint64_t count = 0;
+    unsigned flushes;
     size_t i;
 
     if (!on_owner(cpu) || cpu->running || !result || !instruction_budget) {
@@ -1595,6 +1598,7 @@ static int run_cpu(AnyPS5QemuCpu *cpu, uint64_t instruction_budget,
             break;
         }
         cs->exception_index = -1;
+        flushes = qatomic_read(&tb_ctx.tb_flush_count);
         cpu_exec_start(cs);
         reason = cpu_exec(cs);
         cpu_exec_end(cs);
@@ -1611,6 +1615,14 @@ static int run_cpu(AnyPS5QemuCpu *cpu, uint64_t instruction_budget,
                 /* An interrupted iteration has not retired an instruction. */
                 cpu->stopped.reason = ANYPS5_QEMU_REQUESTED_STOP;
                 break;
+            }
+            if (qatomic_read(&tb_ctx.tb_flush_count) != flushes) {
+                /*
+                 * The code buffer filled before translating this instruction;
+                 * tb_gen_code flushed it. Nothing retired: retry.
+                 */
+                cpu->full_flushes++;
+                continue;
             }
         }
         if (reason != EXCP_DEBUG) {

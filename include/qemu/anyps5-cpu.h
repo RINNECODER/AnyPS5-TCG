@@ -103,9 +103,9 @@ int anyps5_qemu_cpu_invalidate(AnyPS5QemuCpu *cpu);
 int anyps5_qemu_cpu_invalidate_range(AnyPS5QemuCpu *cpu, uint64_t address,
                                    size_t size);
 typedef struct AnyPS5QemuCodeStats {
-    uint64_t full_flushes;       /* whole-cache flushes issued by this bridge */
+    uint64_t full_flushes;       /* whole-cache flushes, incl. code-buffer overflow */
     uint64_t code_invalidations; /* precise invalidations that hit translated code */
-    uint64_t translations;       /* blocks translated, accumulated across flushes */
+    uint64_t translations;       /* blocks translated; overflow flushes drop earlier ones */
 } AnyPS5QemuCodeStats;
 int anyps5_qemu_cpu_code_stats(AnyPS5QemuCpu *cpu, AnyPS5QemuCodeStats *stats);
 int anyps5_qemu_cpu_get(AnyPS5QemuCpu *cpu, enum AnyPS5QemuRegister reg,
